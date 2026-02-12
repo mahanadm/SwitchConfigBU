@@ -205,6 +205,27 @@ function Build-BerIpAddress {
     return [byte[]]@(0x40, 0x04) + [byte[]]$parts
 }
 
+function Build-BerIpAsOctetString {
+    # HiDiscovery v2 sends IP addresses as OCTET STRING (tag 0x04), not IpAddress (tag 0x40)
+    param([string]$IP)
+    $parts = $IP -split '\.' | ForEach-Object { [byte]$_ }
+    return [byte[]]@(0x04, 0x04) + [byte[]]$parts
+}
+
+function Build-BerGauge32 {
+    # Gauge32 (tag 0x42) — used for prefix length in HiDiscovery
+    param([int]$Value)
+    if ($Value -ge 0 -and $Value -lt 128) {
+        return [byte[]]@(0x42, 0x01, [byte]$Value)
+    } elseif ($Value -lt 256) {
+        return [byte[]]@(0x42, 0x02, 0x00, [byte]$Value)
+    } else {
+        $hi = [byte](($Value -shr 8) -band 0xFF)
+        $lo = [byte]($Value -band 0xFF)
+        return [byte[]]@(0x42, 0x02, $hi, $lo)
+    }
+}
+
 function Build-SnmpVarbind {
     param([string]$Oid, [byte[]]$ValueTlv = $null)
     $oidTlv = ConvertTo-BerOid -OidString $Oid
@@ -1050,6 +1071,16 @@ function PrefixToMask {
     $b3 = ($mask -shr 8) -band 0xFF
     $b4 = $mask -band 0xFF
     return "$b1.$b2.$b3.$b4"
+}
+
+function MaskToPrefix {
+    param([string]$Mask)
+    $parts = $Mask -split '\.' | ForEach-Object { [int]$_ }
+    $bits = 0
+    foreach ($p in $parts) {
+        while ($p -gt 0) { $bits += ($p -band 1); $p = $p -shr 1 }
+    }
+    return $bits
 }
 
 function Export-EncryptedCredentials {
@@ -4523,7 +4554,7 @@ $script:hdpOids = @{
     NetPrefixLen  = "1.3.6.1.4.1.248.16.100.2.5.0"   # Gauge32 - prefix length
     NetDHCP       = "1.3.6.1.4.1.248.16.100.2.6.0"   # INTEGER
     NetGateway    = "1.3.6.1.4.1.248.16.100.2.7.0"   # IpAddress - gateway
-    NetAction     = "1.3.6.1.4.1.248.16.100.2.9.0"   # INTEGER - action trigger
+    NetAction     = "1.3.6.1.4.1.248.16.100.2.8.0"   # INTEGER - action trigger (2=apply)
     SysName       = "1.3.6.1.2.1.1.5.0"              # sysName
 }
 
@@ -4845,15 +4876,25 @@ $btnDiscApplyIP.Add_Click({
     $rtbDiscLog.AppendText("[$timestamp] Applying HiDiscovery v2 config to $deviceIP (serial: $deviceSerial)...`n")
 
     # Build multicast SNMP SET packet matching HiView's format
-    # Varbinds: Serial (key), CfgStatus=1, IP, HDP=1, Action=2
+    # HiView sends: Serial (key), CfgStatus=1, IP (as OCTET STRING), HDP=1, Action=2
+    # IP must be OCTET STRING (0x04), NOT IpAddress (0x40) — confirmed from pcap
     $varbinds = [byte[]]@()
-    # Serial number (identifier)
+    # Serial number (identifier — required to target the specific device)
     $varbinds += Build-SnmpVarbind -Oid "1.3.6.1.4.1.248.16.100.2.1.0" -ValueTlv (Build-BerOctetString -Value $deviceSerial)
     # Config status = 1 (configured)
     $varbinds += Build-SnmpVarbind -Oid "1.3.6.1.4.1.248.16.100.2.3.0" -ValueTlv (Build-BerInteger -Value 1)
-    # IP Address
+    # IP Address (as OCTET STRING — 4 raw bytes, matching HiView)
     if ($newIP) {
-        $varbinds += Build-SnmpVarbind -Oid "1.3.6.1.4.1.248.16.100.2.4.0" -ValueTlv (Build-BerIpAddress -IP $newIP)
+        $varbinds += Build-SnmpVarbind -Oid "1.3.6.1.4.1.248.16.100.2.4.0" -ValueTlv (Build-BerIpAsOctetString -IP $newIP)
+    }
+    # Netmask as prefix length (Gauge32)
+    if ($newMask) {
+        $prefix = MaskToPrefix -Mask $newMask
+        $varbinds += Build-SnmpVarbind -Oid "1.3.6.1.4.1.248.16.100.2.5.0" -ValueTlv (Build-BerGauge32 -Value $prefix)
+    }
+    # Gateway (as OCTET STRING — 4 raw bytes, same as IP)
+    if ($newGateway) {
+        $varbinds += Build-SnmpVarbind -Oid "1.3.6.1.4.1.248.16.100.2.7.0" -ValueTlv (Build-BerIpAsOctetString -IP $newGateway)
     }
     # HDP enabled = 1
     $varbinds += Build-SnmpVarbind -Oid "1.3.6.1.4.1.248.16.100.2.2.0" -ValueTlv (Build-BerInteger -Value 1)
@@ -4896,7 +4937,8 @@ $btnDiscApplyIP.Add_Click({
     $rtbDiscLog.ScrollToCaret()
 })
 
-# -- Discovery: Flash LED --
+# -- Discovery: Flash LED via HiDiscovery v2 multicast (toggle on/off) --
+$script:ledSignalOn = $false
 $btnDiscFlashLED.Add_Click({
     if ($dgvDiscovery.SelectedRows.Count -eq 0) {
         [System.Windows.Forms.MessageBox]::Show("Select a device in the grid first.", "No Selection")
@@ -4904,29 +4946,56 @@ $btnDiscFlashLED.Add_Click({
     }
     $row = $dgvDiscovery.SelectedRows[0]
     $deviceIP = $row.Cells["IPAddress"].Value
-    $writeCommunity = "private"
+    $deviceSerial = $row.Cells["Serial"].Value
+
+    if (-not $deviceSerial) {
+        [System.Windows.Forms.MessageBox]::Show("Device serial number not available.", "Error")
+        return
+    }
+
+    # Toggle: 1 = signal on, 2 = signal off
+    $signalValue = if ($script:ledSignalOn) { 2 } else { 1 }
+    $action = if ($script:ledSignalOn) { "Stopping" } else { "Starting" }
 
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $rtbDiscLog.AppendText("[$timestamp] Flashing LED on $deviceIP...`n")
+    $rtbDiscLog.AppendText("[$timestamp] $action LED signal on $deviceIP...`n")
 
-    # Hirschmann signal LED OID: hmSysLED = 1.3.6.1.4.1.248.14.1.2.1.0
-    # Value 1 = on, value 2 = off (or similar, varies by model)
-    # Try hmSysGroupSignalLED: 1.3.6.1.4.1.248.14.1.1.9.0  (1=enable, 2=disable)
-    $ledOnTlv = Build-BerInteger -Value 1
-    $result = Invoke-SnmpSet -IP $deviceIP -Oid "1.3.6.1.4.1.248.14.1.1.9.0" -ValueTlv $ledOnTlv -Community $writeCommunity -TimeoutMs 3000
-    if ($result -and $result.ErrorStatus -eq 0) {
-        $rtbDiscLog.AppendText("[$timestamp]   Signal LED activated on $deviceIP`n")
-        $rtbDiscLog.AppendText("[$timestamp]   LED will flash for ~30 seconds (device-dependent).`n")
-    } else {
-        $errCode = if ($result) { $result.ErrorStatus } else { "No response" }
-        $rtbDiscLog.AppendText("[$timestamp]   LED flash FAILED (error: $errCode). Device may not support this OID.`n")
-        # Try alternative OID
-        $result2 = Invoke-SnmpSet -IP $deviceIP -Oid "1.3.6.1.4.1.248.14.1.2.1.0" -ValueTlv $ledOnTlv -Community $writeCommunity -TimeoutMs 3000
-        if ($result2 -and $result2.ErrorStatus -eq 0) {
-            $rtbDiscLog.AppendText("[$timestamp]   Signal LED activated via alternate OID.`n")
-        } else {
-            $rtbDiscLog.AppendText("[$timestamp]   Alternate OID also failed. Check write community and device support.`n")
+    # HiDiscovery v2 signal: SET OID .2.9.0 via multicast with serial as key
+    $varbinds = [byte[]]@()
+    $varbinds += Build-SnmpVarbind -Oid "1.3.6.1.4.1.248.16.100.2.1.0" -ValueTlv (Build-BerOctetString -Value $deviceSerial)
+    $varbinds += Build-SnmpVarbind -Oid "1.3.6.1.4.1.248.16.100.2.9.0" -ValueTlv (Build-BerInteger -Value $signalValue)
+
+    $varbindList = Build-BerSequence -Content $varbinds
+    $reqIdBer = Build-BerInteger -Value 0
+    $errorStatusBer = Build-BerInteger -Value 0
+    $errorIndexBer = Build-BerInteger -Value 0
+    $pduContent = $reqIdBer + $errorStatusBer + $errorIndexBer + $varbindList
+    $pduLenBytes = ConvertTo-BerLength -Length $pduContent.Count
+    $pdu = [byte[]]@(0xA3) + $pduLenBytes + $pduContent
+    $versionBer = Build-BerInteger -Value 1
+    $communityBer = Build-BerOctetString -Value "@discover@"
+    $messageContent = $versionBer + $communityBer + $pdu
+    $setPacket = Build-BerSequence -Content $messageContent
+
+    try {
+        $localIP = "0.0.0.0"
+        if ($cboDiscNic.SelectedIndex -ge 0 -and $cboDiscNic.Tag -and $cboDiscNic.Tag.Count -gt $cboDiscNic.SelectedIndex) {
+            $nicInfo = $cboDiscNic.Tag[$cboDiscNic.SelectedIndex]
+            if ($nicInfo.IP) { $localIP = $nicInfo.IP }
         }
+
+        $udp = New-Object System.Net.Sockets.UdpClient
+        $localEP = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Parse($localIP), 0)
+        $udp.Client.Bind($localEP)
+        $mcastEP = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Parse("239.255.16.12"), 51973)
+        $null = $udp.Send($setPacket, $setPacket.Length, $mcastEP)
+        $udp.Close()
+
+        $script:ledSignalOn = -not $script:ledSignalOn
+        $btnDiscFlashLED.Text = if ($script:ledSignalOn) { "Stop LED" } else { "Flash LED" }
+        $rtbDiscLog.AppendText("[$timestamp]   Signal sent ($($setPacket.Length) bytes)`n")
+    } catch {
+        $rtbDiscLog.AppendText("[$timestamp]   ERROR: $($_.Exception.Message)`n")
     }
     $rtbDiscLog.ScrollToCaret()
 })
@@ -4993,33 +5062,81 @@ $btnDiscChangePwd.Add_Click({
         return
     }
 
-    # Try each credential
+    # Hirschmann factory-default behavior: SSH login with admin/private triggers
+    # interactive "Enter new password:" + "Confirm new password:" prompts.
+    # IMPORTANT: Must use Write("pwd\n") NOT WriteLine("pwd") — PTY converts \r\n
+    # from WriteLine into double newlines, causing empty confirmation.
     $success = $false
+
+    # Build credential list: saved credentials + factory default
+    $credList = @()
     foreach ($cred in $script:credentials) {
-        $commands = @()
-        if ($newPwd) {
-            # Hirschmann CLI: change user password
-            $commands += "users password admin `"$newPwd`""
-        }
-        if ($newEnable) {
-            # Hirschmann CLI: change enable password (if applicable)
-            $commands += "users password enable `"$newEnable`""
-        }
-        $commands += "exit"
+        $credList += @{ Username = $cred.Username; Password = $cred.Password }
+    }
+    $hasDefault = $credList | Where-Object { $_.Username -eq "admin" -and $_.Password -eq "private" }
+    if (-not $hasDefault) {
+        $credList += @{ Username = "admin"; Password = "private" }
+    }
 
-        $result = Invoke-PlinkInteractive -PlinkPath $plinkPath -IP $deviceIP `
-            -Username $cred.Username -Password $cred.Password -HostKey $hostKey `
-            -Commands $commands -Timeout 15000 -ReadDelay 3000
+    foreach ($cred in $credList) {
+        $rtbDiscLog.AppendText("[$timestamp]   Trying $($cred.Username)...`n")
+        $rtbDiscLog.ScrollToCaret()
 
-        if ($result.StdOut -and $result.StdOut -notmatch 'Access denied' -and $result.ExitCode -ne 1) {
-            $success = $true
-            $rtbDiscLog.AppendText("[$timestamp]   Password changed successfully on $deviceIP`n")
-            break
+        try {
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = $plinkPath
+            $psi.Arguments = "-ssh -t -no-antispoof -hostkey `"$hostKey`" -l `"$($cred.Username)`" -pw `"$($cred.Password)`" -P 22 $deviceIP"
+            $psi.RedirectStandardInput = $true
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+            $proc = [System.Diagnostics.Process]::Start($psi)
+            $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+            $stderrTask = $proc.StandardError.ReadToEndAsync()
+
+            # Wait for banner + "Enter new password:" prompt
+            Start-Sleep -Milliseconds 5000
+
+            # Send new password (Write + \n, NOT WriteLine which sends \r\n)
+            $proc.StandardInput.Write("$newPwd`n")
+            $proc.StandardInput.Flush()
+            Start-Sleep -Milliseconds 2000
+
+            # Send confirmation
+            $proc.StandardInput.Write("$newPwd`n")
+            $proc.StandardInput.Flush()
+            Start-Sleep -Milliseconds 3000
+
+            # Exit session
+            $proc.StandardInput.Write("exit`n")
+            $proc.StandardInput.Flush()
+            Start-Sleep -Milliseconds 1000
+
+            $proc.StandardInput.Close()
+            if (-not $proc.WaitForExit(10000)) { try { $proc.Kill() } catch {} }
+
+            $stdout = ""; $stderr = ""
+            try { if ($stdoutTask.Wait(5000)) { $stdout = $stdoutTask.Result } } catch {}
+            try { if ($stderrTask.Wait(5000)) { $stderr = $stderrTask.Result } } catch {}
+            try { $proc.Dispose() } catch {}
+
+            if ($stdout -match 'Password changed') {
+                $success = $true
+                $rtbDiscLog.AppendText("[$timestamp]   Password changed successfully on $deviceIP`n")
+                break
+            } elseif ($stdout -match 'Access denied' -or $stderr -match 'Access denied') {
+                $rtbDiscLog.AppendText("[$timestamp]   Auth failed with $($cred.Username)`n")
+            } else {
+                $rtbDiscLog.AppendText("[$timestamp]   No password prompt detected with $($cred.Username)`n")
+            }
+        } catch {
+            $rtbDiscLog.AppendText("[$timestamp]   ERROR: $($_.Exception.Message)`n")
         }
     }
 
     if (-not $success) {
-        $rtbDiscLog.AppendText("[$timestamp]   ERROR: Failed to change password. Check credentials and device access.`n")
+        $rtbDiscLog.AppendText("[$timestamp]   ERROR: Failed to change password. Ensure the switch has factory default credentials (admin/private).`n")
     }
     $rtbDiscLog.ScrollToCaret()
 })
