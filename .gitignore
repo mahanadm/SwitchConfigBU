@@ -1,0 +1,15 @@
+# Encrypted credentials (contains DPAPI-encrypted passwords, machine-specific)
+switch_creds.xml
+
+# Packet captures (reference only, not needed for runtime)
+*.pcap
+
+# Claude Code project files
+.claude/
+
+# Windows/IDE junk
+Thumbs.db
+desktop.ini
+*.swp
+*.bak
+*.tmp
