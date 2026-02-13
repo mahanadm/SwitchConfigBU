@@ -1091,11 +1091,12 @@ function Export-EncryptedCredentials {
     $exportList = @()
     foreach ($cred in $Credentials) {
         $secPass = ConvertTo-SecureString $cred.Password -AsPlainText -Force
-        $secEnable = ConvertTo-SecureString $cred.EnablePassword -AsPlainText -Force
+        $enablePwd = if ($cred.EnablePassword) { $cred.EnablePassword } else { "" }
+        $secEnable = if ($enablePwd) { ConvertTo-SecureString $enablePwd -AsPlainText -Force } else { $null }
         $exportList += @{
             Username       = $cred.Username
             Password       = ($secPass | ConvertFrom-SecureString)
-            EnablePassword = ($secEnable | ConvertFrom-SecureString)
+            EnablePassword = if ($secEnable) { ($secEnable | ConvertFrom-SecureString) } else { "" }
         }
     }
     $exportList | Export-Clixml -Path $FilePath -Force
@@ -1110,16 +1111,23 @@ function Import-EncryptedCredentials {
     foreach ($item in $importList) {
         try {
             $secPass = ConvertTo-SecureString $item.Password
-            $secEnable = ConvertTo-SecureString $item.EnablePassword
             $passPtr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secPass)
-            $enablePtr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secEnable)
+            $plainPass = [Runtime.InteropServices.Marshal]::PtrToStringAuto($passPtr)
+            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($passPtr)
+
+            $plainEnable = ""
+            if ($item.EnablePassword) {
+                $secEnable = ConvertTo-SecureString $item.EnablePassword
+                $enablePtr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secEnable)
+                $plainEnable = [Runtime.InteropServices.Marshal]::PtrToStringAuto($enablePtr)
+                [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($enablePtr)
+            }
+
             $creds += @{
                 Username       = $item.Username
-                Password       = [Runtime.InteropServices.Marshal]::PtrToStringAuto($passPtr)
-                EnablePassword = [Runtime.InteropServices.Marshal]::PtrToStringAuto($enablePtr)
+                Password       = $plainPass
+                EnablePassword = $plainEnable
             }
-            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($passPtr)
-            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($enablePtr)
         } catch {
             # Skip entries that can't be decrypted (different user/machine)
         }
@@ -1186,6 +1194,8 @@ $sync = [hashtable]::Synchronized(@{
     DiscoveryLog       = @()
     DiscoveryLogIndex  = 0
     DiscoveryCancel    = $false
+    DiscIPApplied      = $false
+    DiscPwdChanged     = $false
 })
 
 # Store discovered devices
@@ -1784,6 +1794,18 @@ $btnLoadCreds.Location = New-Object System.Drawing.Point(400, 75)
 $btnLoadCreds.Size = New-Object System.Drawing.Size(80, 27)
 $panelCredTop.Controls.Add($btnLoadCreds)
 
+$btnMoveUp = New-Object System.Windows.Forms.Button
+$btnMoveUp.Text = "Move Up"
+$btnMoveUp.Location = New-Object System.Drawing.Point(400, 9)
+$btnMoveUp.Size = New-Object System.Drawing.Size(80, 27)
+$panelCredTop.Controls.Add($btnMoveUp)
+
+$btnMoveDown = New-Object System.Windows.Forms.Button
+$btnMoveDown.Text = "Move Down"
+$btnMoveDown.Location = New-Object System.Drawing.Point(400, 42)
+$btnMoveDown.Size = New-Object System.Drawing.Size(80, 27)
+$panelCredTop.Controls.Add($btnMoveDown)
+
 $chkShowPasswords = New-Object System.Windows.Forms.CheckBox
 $chkShowPasswords.Text = "Show Passwords"
 $chkShowPasswords.Location = New-Object System.Drawing.Point(500, 12)
@@ -2164,57 +2186,24 @@ $tabDiscovery.Text = "Discovery"
 $tabDiscovery.Padding = New-Object System.Windows.Forms.Padding(6)
 $tabControl.TabPages.Add($tabDiscovery)
 
-# -- Discovery top panel: buttons --
+# -- Discovery top panel: NIC selector + buttons --
 $panelDiscTop = New-Object System.Windows.Forms.Panel
 $panelDiscTop.Dock = 'Top'
-$panelDiscTop.Height = 38
+$panelDiscTop.Height = 66
 $tabDiscovery.Controls.Add($panelDiscTop)
 
-$btnDiscScan = New-Object System.Windows.Forms.Button
-$btnDiscScan.Text = "Scan"
-$btnDiscScan.Location = New-Object System.Drawing.Point(8, 5)
-$btnDiscScan.Size = New-Object System.Drawing.Size(75, 27)
-$panelDiscTop.Controls.Add($btnDiscScan)
-
-$btnDiscStop = New-Object System.Windows.Forms.Button
-$btnDiscStop.Text = "Stop"
-$btnDiscStop.Location = New-Object System.Drawing.Point(90, 5)
-$btnDiscStop.Size = New-Object System.Drawing.Size(75, 27)
-$btnDiscStop.Enabled = $false
-$panelDiscTop.Controls.Add($btnDiscStop)
-
-$lblDiscTimeout = New-Object System.Windows.Forms.Label
-$lblDiscTimeout.Text = "Timeout (s):"
-$lblDiscTimeout.Location = New-Object System.Drawing.Point(185, 10)
-$lblDiscTimeout.AutoSize = $true
-$panelDiscTop.Controls.Add($lblDiscTimeout)
-
-$numDiscTimeout = New-Object System.Windows.Forms.NumericUpDown
-$numDiscTimeout.Location = New-Object System.Drawing.Point(260, 7)
-$numDiscTimeout.Size = New-Object System.Drawing.Size(55, 23)
-$numDiscTimeout.Minimum = 1
-$numDiscTimeout.Maximum = 30
-$numDiscTimeout.Value = 5
-$panelDiscTop.Controls.Add($numDiscTimeout)
-
-$chkDiscSsh = New-Object System.Windows.Forms.CheckBox
-$chkDiscSsh.Text = "SSH Enrich"
-$chkDiscSsh.Location = New-Object System.Drawing.Point(330, 8)
-$chkDiscSsh.AutoSize = $true
-$chkDiscSsh.Checked = $false
-$panelDiscTop.Controls.Add($chkDiscSsh)
-
-# -- Discovery bottom panel: NIC selector + status --
-$panelDiscBottom = New-Object System.Windows.Forms.Panel
-$panelDiscBottom.Dock = 'Bottom'
-$panelDiscBottom.Height = 30
-$tabDiscovery.Controls.Add($panelDiscBottom)
+# Row 1: NIC selector
+$lblDiscNic = New-Object System.Windows.Forms.Label
+$lblDiscNic.Text = "Interface:"
+$lblDiscNic.Location = New-Object System.Drawing.Point(8, 7)
+$lblDiscNic.AutoSize = $true
+$panelDiscTop.Controls.Add($lblDiscNic)
 
 $cboDiscNic = New-Object System.Windows.Forms.ComboBox
 $cboDiscNic.DropDownStyle = 'DropDownList'
-$cboDiscNic.Location = New-Object System.Drawing.Point(8, 4)
+$cboDiscNic.Location = New-Object System.Drawing.Point(75, 4)
 $cboDiscNic.Size = New-Object System.Drawing.Size(450, 23)
-$panelDiscBottom.Controls.Add($cboDiscNic)
+$panelDiscTop.Controls.Add($cboDiscNic)
 
 # Populate NIC selector with IPv4-capable interfaces
 $nicInfoList = [System.Collections.ArrayList]::new()
@@ -2232,16 +2221,60 @@ foreach ($nic in $nics) {
 $cboDiscNic.Tag = $nicInfoList
 if ($cboDiscNic.Items.Count -gt 0) { $cboDiscNic.SelectedIndex = 0 }
 
+# Row 2: Scan controls
+$btnDiscScan = New-Object System.Windows.Forms.Button
+$btnDiscScan.Text = "Scan"
+$btnDiscScan.Location = New-Object System.Drawing.Point(8, 33)
+$btnDiscScan.Size = New-Object System.Drawing.Size(75, 27)
+$panelDiscTop.Controls.Add($btnDiscScan)
+
+$btnDiscStop = New-Object System.Windows.Forms.Button
+$btnDiscStop.Text = "Stop"
+$btnDiscStop.Location = New-Object System.Drawing.Point(90, 33)
+$btnDiscStop.Size = New-Object System.Drawing.Size(75, 27)
+$btnDiscStop.Enabled = $false
+$panelDiscTop.Controls.Add($btnDiscStop)
+
+$lblDiscTimeout = New-Object System.Windows.Forms.Label
+$lblDiscTimeout.Text = "Timeout (s):"
+$lblDiscTimeout.Location = New-Object System.Drawing.Point(185, 38)
+$lblDiscTimeout.AutoSize = $true
+$panelDiscTop.Controls.Add($lblDiscTimeout)
+
+$numDiscTimeout = New-Object System.Windows.Forms.NumericUpDown
+$numDiscTimeout.Location = New-Object System.Drawing.Point(260, 35)
+$numDiscTimeout.Size = New-Object System.Drawing.Size(55, 23)
+$numDiscTimeout.Minimum = 1
+$numDiscTimeout.Maximum = 30
+$numDiscTimeout.Value = 5
+$panelDiscTop.Controls.Add($numDiscTimeout)
+
+$chkDiscSsh = New-Object System.Windows.Forms.CheckBox
+$chkDiscSsh.Text = "SSH Enrich"
+$chkDiscSsh.Location = New-Object System.Drawing.Point(330, 36)
+$chkDiscSsh.AutoSize = $true
+$chkDiscSsh.Checked = $false
+$panelDiscTop.Controls.Add($chkDiscSsh)
+
+$toolTipDiscSsh = New-Object System.Windows.Forms.ToolTip
+$toolTipDiscSsh.SetToolTip($chkDiscSsh, "When enabled, uses SSH to gather additional device details`n(hostname, config) after multicast discovery. Requires credentials.")
+
+# -- Discovery bottom panel: progress + status --
+$panelDiscBottom = New-Object System.Windows.Forms.Panel
+$panelDiscBottom.Dock = 'Bottom'
+$panelDiscBottom.Height = 30
+$tabDiscovery.Controls.Add($panelDiscBottom)
+
 $progressDisc = New-Object System.Windows.Forms.ProgressBar
-$progressDisc.Location = New-Object System.Drawing.Point(465, 4)
+$progressDisc.Location = New-Object System.Drawing.Point(8, 4)
 $progressDisc.Size = New-Object System.Drawing.Size(150, 20)
 $progressDisc.Style = 'Marquee'
 $progressDisc.MarqueeAnimationSpeed = 0
 $panelDiscBottom.Controls.Add($progressDisc)
 
 $lblDiscStatus = New-Object System.Windows.Forms.Label
-$lblDiscStatus.Location = New-Object System.Drawing.Point(622, 6)
-$lblDiscStatus.Size = New-Object System.Drawing.Size(400, 18)
+$lblDiscStatus.Location = New-Object System.Drawing.Point(165, 6)
+$lblDiscStatus.Size = New-Object System.Drawing.Size(600, 18)
 $lblDiscStatus.Text = "Ready. HiDiscovery v2 protocol."
 $panelDiscBottom.Controls.Add($lblDiscStatus)
 
@@ -2253,12 +2286,7 @@ $splitDisc.SplitterDistance = 280
 $tabDiscovery.Controls.Add($splitDisc)
 $tabDiscovery.Controls.SetChildIndex($splitDisc, 0)
 
-# -- Upper split: device grid + management panel --
-$splitDiscUpper = New-Object System.Windows.Forms.SplitContainer
-$splitDiscUpper.Dock = 'Fill'
-$splitDiscUpper.Orientation = 'Horizontal'
-$splitDiscUpper.SplitterDistance = 180
-$splitDisc.Panel1.Controls.Add($splitDiscUpper)
+# -- Upper area: device grid with selection buttons --
 
 # -- Device Grid --
 $dgvDiscovery = New-Object System.Windows.Forms.DataGridView
@@ -2362,13 +2390,13 @@ $colDiscSerial.HeaderText = "Serial"
 $colDiscSerial.Visible = $false
 $null = $dgvDiscovery.Columns.Add($colDiscSerial)
 
-$splitDiscUpper.Panel1.Controls.Add($dgvDiscovery)
+$splitDisc.Panel1.Controls.Add($dgvDiscovery)
 
-# -- Selection buttons panel between grid and management --
+# -- Selection buttons panel below grid --
 $panelDiscSelect = New-Object System.Windows.Forms.Panel
 $panelDiscSelect.Dock = 'Bottom'
 $panelDiscSelect.Height = 30
-$splitDiscUpper.Panel1.Controls.Add($panelDiscSelect)
+$splitDisc.Panel1.Controls.Add($panelDiscSelect)
 
 $btnDiscSelectAll = New-Object System.Windows.Forms.Button
 $btnDiscSelectAll.Text = "Select All"
@@ -2382,108 +2410,18 @@ $btnDiscSelectNone.Location = New-Object System.Drawing.Point(95, 2)
 $btnDiscSelectNone.Size = New-Object System.Drawing.Size(85, 25)
 $panelDiscSelect.Controls.Add($btnDiscSelectNone)
 
-# -- Management GroupBox --
-$grpDiscManage = New-Object System.Windows.Forms.GroupBox
-$grpDiscManage.Text = "Device Management"
-$grpDiscManage.Dock = 'Fill'
-$grpDiscManage.Padding = New-Object System.Windows.Forms.Padding(8)
-$splitDiscUpper.Panel2.Controls.Add($grpDiscManage)
-
-# Row 1: IP assignment
-$lblDiscNewIP = New-Object System.Windows.Forms.Label
-$lblDiscNewIP.Text = "New IP:"
-$lblDiscNewIP.Location = New-Object System.Drawing.Point(12, 22)
-$lblDiscNewIP.AutoSize = $true
-$grpDiscManage.Controls.Add($lblDiscNewIP)
-
-$txtDiscNewIP = New-Object System.Windows.Forms.TextBox
-$txtDiscNewIP.Location = New-Object System.Drawing.Point(72, 19)
-$txtDiscNewIP.Size = New-Object System.Drawing.Size(130, 23)
-$grpDiscManage.Controls.Add($txtDiscNewIP)
-
-$lblDiscNewMask = New-Object System.Windows.Forms.Label
-$lblDiscNewMask.Text = "Mask:"
-$lblDiscNewMask.Location = New-Object System.Drawing.Point(212, 22)
-$lblDiscNewMask.AutoSize = $true
-$grpDiscManage.Controls.Add($lblDiscNewMask)
-
-$txtDiscNewMask = New-Object System.Windows.Forms.TextBox
-$txtDiscNewMask.Location = New-Object System.Drawing.Point(252, 19)
-$txtDiscNewMask.Size = New-Object System.Drawing.Size(130, 23)
-$txtDiscNewMask.Text = "255.255.255.0"
-$grpDiscManage.Controls.Add($txtDiscNewMask)
-
-$lblDiscNewGateway = New-Object System.Windows.Forms.Label
-$lblDiscNewGateway.Text = "Gateway:"
-$lblDiscNewGateway.Location = New-Object System.Drawing.Point(392, 22)
-$lblDiscNewGateway.AutoSize = $true
-$grpDiscManage.Controls.Add($lblDiscNewGateway)
-
-$txtDiscNewGateway = New-Object System.Windows.Forms.TextBox
-$txtDiscNewGateway.Location = New-Object System.Drawing.Point(455, 19)
-$txtDiscNewGateway.Size = New-Object System.Drawing.Size(130, 23)
-$grpDiscManage.Controls.Add($txtDiscNewGateway)
-
-$lblDiscNewName = New-Object System.Windows.Forms.Label
-$lblDiscNewName.Text = "Name:"
-$lblDiscNewName.Location = New-Object System.Drawing.Point(595, 22)
-$lblDiscNewName.AutoSize = $true
-$grpDiscManage.Controls.Add($lblDiscNewName)
-
-$txtDiscNewName = New-Object System.Windows.Forms.TextBox
-$txtDiscNewName.Location = New-Object System.Drawing.Point(640, 19)
-$txtDiscNewName.Size = New-Object System.Drawing.Size(130, 23)
-$grpDiscManage.Controls.Add($txtDiscNewName)
-
-# Row 2: Action buttons
-$btnDiscApplyIP = New-Object System.Windows.Forms.Button
-$btnDiscApplyIP.Text = "Apply IP Config"
-$btnDiscApplyIP.Location = New-Object System.Drawing.Point(12, 50)
-$btnDiscApplyIP.Size = New-Object System.Drawing.Size(110, 27)
-$grpDiscManage.Controls.Add($btnDiscApplyIP)
-
-$btnDiscFlashLED = New-Object System.Windows.Forms.Button
-$btnDiscFlashLED.Text = "Flash LED"
-$btnDiscFlashLED.Location = New-Object System.Drawing.Point(130, 50)
-$btnDiscFlashLED.Size = New-Object System.Drawing.Size(85, 27)
-$grpDiscManage.Controls.Add($btnDiscFlashLED)
-
-$btnDiscOpenWeb = New-Object System.Windows.Forms.Button
-$btnDiscOpenWeb.Text = "Open Web UI"
-$btnDiscOpenWeb.Location = New-Object System.Drawing.Point(223, 50)
-$btnDiscOpenWeb.Size = New-Object System.Drawing.Size(100, 27)
-$grpDiscManage.Controls.Add($btnDiscOpenWeb)
-
-# Row 2 continued: Password section
-$lblDiscNewPwd = New-Object System.Windows.Forms.Label
-$lblDiscNewPwd.Text = "New Password:"
-$lblDiscNewPwd.Location = New-Object System.Drawing.Point(355, 54)
-$lblDiscNewPwd.AutoSize = $true
-$grpDiscManage.Controls.Add($lblDiscNewPwd)
-
-$txtDiscNewPassword = New-Object System.Windows.Forms.TextBox
-$txtDiscNewPassword.Location = New-Object System.Drawing.Point(450, 51)
-$txtDiscNewPassword.Size = New-Object System.Drawing.Size(120, 23)
-$txtDiscNewPassword.UseSystemPasswordChar = $true
-$grpDiscManage.Controls.Add($txtDiscNewPassword)
-
-$lblDiscNewEnable = New-Object System.Windows.Forms.Label
-$lblDiscNewEnable.Text = "Enable Pwd:"
-$lblDiscNewEnable.Location = New-Object System.Drawing.Point(580, 54)
-$lblDiscNewEnable.AutoSize = $true
-$grpDiscManage.Controls.Add($lblDiscNewEnable)
-
-$txtDiscNewEnable = New-Object System.Windows.Forms.TextBox
-$txtDiscNewEnable.Location = New-Object System.Drawing.Point(660, 51)
-$txtDiscNewEnable.Size = New-Object System.Drawing.Size(120, 23)
-$txtDiscNewEnable.UseSystemPasswordChar = $true
-$grpDiscManage.Controls.Add($txtDiscNewEnable)
-
-$btnDiscChangePwd = New-Object System.Windows.Forms.Button
-$btnDiscChangePwd.Text = "Change Password"
-$btnDiscChangePwd.Location = New-Object System.Drawing.Point(790, 50)
-$btnDiscChangePwd.Size = New-Object System.Drawing.Size(120, 27)
-$grpDiscManage.Controls.Add($btnDiscChangePwd)
+# -- Device Management popup variables (populated on double-click) --
+$script:discManageForm = $null
+$script:txtDiscNewIP = $null
+$script:txtDiscNewMask = $null
+$script:txtDiscNewGateway = $null
+$script:txtDiscNewName = $null
+$script:txtDiscNewPassword = $null
+$script:txtDiscNewEnable = $null
+$script:btnDiscApplyIP = $null
+$script:btnDiscFlashLED = $null
+$script:btnDiscOpenWeb = $null
+$script:btnDiscChangePwd = $null
 
 # -- Lower split: Log --
 $rtbDiscLog = New-Object System.Windows.Forms.RichTextBox
@@ -2521,15 +2459,215 @@ $dgvDiscovery.Add_CurrentCellDirtyStateChanged({
     }
 })
 
-# -- Auto-populate management fields when selecting a device --
-$dgvDiscovery.Add_SelectionChanged({
-    if ($dgvDiscovery.SelectedRows.Count -gt 0) {
-        $row = $dgvDiscovery.SelectedRows[0]
-        $txtDiscNewIP.Text = $row.Cells["IPAddress"].Value
-        $txtDiscNewMask.Text = $row.Cells["Netmask"].Value
-        $txtDiscNewGateway.Text = $row.Cells["Gateway"].Value
-        $txtDiscNewName.Text = $row.Cells["Hostname"].Value
+# -- Signal checkbox toggles LED flash on/off per device --
+$dgvDiscovery.Add_CellValueChanged({
+    param($s, $e)
+    if ($e.RowIndex -lt 0) { return }
+    if ($dgvDiscovery.Columns[$e.ColumnIndex].Name -ne "Signal") { return }
+
+    $row = $dgvDiscovery.Rows[$e.RowIndex]
+    $checked = $row.Cells["Signal"].Value
+    $deviceIP = $row.Cells["IPAddress"].Value
+    $deviceSerial = $row.Cells["Serial"].Value
+
+    if (-not $deviceSerial) { return }
+
+    # 1 = signal on, 2 = signal off
+    $signalValue = if ($checked) { 1 } else { 2 }
+    $action = if ($checked) { "Starting" } else { "Stopping" }
+
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $rtbDiscLog.AppendText("[$timestamp] $action LED signal on $deviceIP...`n")
+
+    $varbinds = [byte[]]@()
+    $varbinds += Build-SnmpVarbind -Oid "1.3.6.1.4.1.248.16.100.2.1.0" -ValueTlv (Build-BerOctetString -Value $deviceSerial)
+    $varbinds += Build-SnmpVarbind -Oid "1.3.6.1.4.1.248.16.100.2.9.0" -ValueTlv (Build-BerInteger -Value $signalValue)
+
+    $varbindList = Build-BerSequence -Content $varbinds
+    $reqIdBer = Build-BerInteger -Value 0
+    $errorStatusBer = Build-BerInteger -Value 0
+    $errorIndexBer = Build-BerInteger -Value 0
+    $pduContent = $reqIdBer + $errorStatusBer + $errorIndexBer + $varbindList
+    $pduLenBytes = ConvertTo-BerLength -Length $pduContent.Count
+    $pdu = [byte[]]@(0xA3) + $pduLenBytes + $pduContent
+    $versionBer = Build-BerInteger -Value 1
+    $communityBer = Build-BerOctetString -Value "@discover@"
+    $messageContent = $versionBer + $communityBer + $pdu
+    $setPacket = Build-BerSequence -Content $messageContent
+
+    try {
+        $localIP = "0.0.0.0"
+        if ($cboDiscNic.SelectedIndex -ge 0 -and $cboDiscNic.Tag -and $cboDiscNic.Tag.Count -gt $cboDiscNic.SelectedIndex) {
+            $nicInfo = $cboDiscNic.Tag[$cboDiscNic.SelectedIndex]
+            if ($nicInfo.IP) { $localIP = $nicInfo.IP }
+        }
+
+        $udp = New-Object System.Net.Sockets.UdpClient
+        $localEP = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Parse($localIP), 0)
+        $udp.Client.Bind($localEP)
+        $mcastEP = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Parse("239.255.16.12"), 51973)
+        $null = $udp.Send($setPacket, $setPacket.Length, $mcastEP)
+        $udp.Close()
+
+        $rtbDiscLog.AppendText("[$timestamp]   Signal sent ($($setPacket.Length) bytes)`n")
+    } catch {
+        $rtbDiscLog.AppendText("[$timestamp]   ERROR: $($_.Exception.Message)`n")
     }
+    $rtbDiscLog.ScrollToCaret()
+})
+
+# -- Double-click opens Device Management popup --
+$dgvDiscovery.Add_CellDoubleClick({
+    param($s, $e)
+    if ($e.RowIndex -lt 0) { return }
+    $row = $dgvDiscovery.Rows[$e.RowIndex]
+    $deviceIP = $row.Cells["IPAddress"].Value
+    $deviceMAC = $row.Cells["MACAddress"].Value
+    $deviceProduct = $row.Cells["Product"].Value
+
+    # Build the popup form
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = "Device Management - $deviceMAC"
+    $dlg.Size = New-Object System.Drawing.Size(480, 310)
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox = $false
+    $dlg.MinimizeBox = $false
+
+    # Device info header
+    $lblDevInfo = New-Object System.Windows.Forms.Label
+    $lblDevInfo.Text = "$deviceProduct  ($deviceMAC)"
+    $lblDevInfo.Location = New-Object System.Drawing.Point(12, 12)
+    $lblDevInfo.AutoSize = $true
+    $lblDevInfo.Font = New-Object System.Drawing.Font($dlg.Font.FontFamily, 9, [System.Drawing.FontStyle]::Bold)
+    $dlg.Controls.Add($lblDevInfo)
+
+    # -- IP Configuration group --
+    $grpIP = New-Object System.Windows.Forms.GroupBox
+    $grpIP.Text = "IP Configuration"
+    $grpIP.Location = New-Object System.Drawing.Point(12, 36)
+    $grpIP.Size = New-Object System.Drawing.Size(448, 85)
+    $dlg.Controls.Add($grpIP)
+
+    $lblIP = New-Object System.Windows.Forms.Label
+    $lblIP.Text = "IP:"
+    $lblIP.Location = New-Object System.Drawing.Point(10, 24)
+    $lblIP.AutoSize = $true
+    $grpIP.Controls.Add($lblIP)
+    $script:txtDiscNewIP = New-Object System.Windows.Forms.TextBox
+    $script:txtDiscNewIP.Location = New-Object System.Drawing.Point(75, 21)
+    $script:txtDiscNewIP.Size = New-Object System.Drawing.Size(130, 23)
+    $script:txtDiscNewIP.Text = $row.Cells["IPAddress"].Value
+    $grpIP.Controls.Add($script:txtDiscNewIP)
+
+    $lblMask = New-Object System.Windows.Forms.Label
+    $lblMask.Text = "Mask:"
+    $lblMask.Location = New-Object System.Drawing.Point(215, 24)
+    $lblMask.AutoSize = $true
+    $grpIP.Controls.Add($lblMask)
+    $script:txtDiscNewMask = New-Object System.Windows.Forms.TextBox
+    $script:txtDiscNewMask.Location = New-Object System.Drawing.Point(260, 21)
+    $script:txtDiscNewMask.Size = New-Object System.Drawing.Size(130, 23)
+    $script:txtDiscNewMask.Text = $row.Cells["Netmask"].Value
+    $grpIP.Controls.Add($script:txtDiscNewMask)
+
+    $lblGw = New-Object System.Windows.Forms.Label
+    $lblGw.Text = "Gateway:"
+    $lblGw.Location = New-Object System.Drawing.Point(10, 54)
+    $lblGw.AutoSize = $true
+    $grpIP.Controls.Add($lblGw)
+    $script:txtDiscNewGateway = New-Object System.Windows.Forms.TextBox
+    $script:txtDiscNewGateway.Location = New-Object System.Drawing.Point(75, 51)
+    $script:txtDiscNewGateway.Size = New-Object System.Drawing.Size(130, 23)
+    $script:txtDiscNewGateway.Text = $row.Cells["Gateway"].Value
+    $grpIP.Controls.Add($script:txtDiscNewGateway)
+
+    $lblName = New-Object System.Windows.Forms.Label
+    $lblName.Text = "Name:"
+    $lblName.Location = New-Object System.Drawing.Point(215, 54)
+    $lblName.AutoSize = $true
+    $grpIP.Controls.Add($lblName)
+    $script:txtDiscNewName = New-Object System.Windows.Forms.TextBox
+    $script:txtDiscNewName.Location = New-Object System.Drawing.Point(260, 51)
+    $script:txtDiscNewName.Size = New-Object System.Drawing.Size(130, 23)
+    $script:txtDiscNewName.Text = $row.Cells["Hostname"].Value
+    $grpIP.Controls.Add($script:txtDiscNewName)
+
+    # -- Password group --
+    $grpPwd = New-Object System.Windows.Forms.GroupBox
+    $grpPwd.Text = "Password"
+    $grpPwd.Location = New-Object System.Drawing.Point(12, 128)
+    $grpPwd.Size = New-Object System.Drawing.Size(448, 55)
+    $dlg.Controls.Add($grpPwd)
+
+    $lblNewPwd = New-Object System.Windows.Forms.Label
+    $lblNewPwd.Text = "New Password:"
+    $lblNewPwd.Location = New-Object System.Drawing.Point(10, 24)
+    $lblNewPwd.AutoSize = $true
+    $grpPwd.Controls.Add($lblNewPwd)
+    $script:txtDiscNewPassword = New-Object System.Windows.Forms.TextBox
+    $script:txtDiscNewPassword.Location = New-Object System.Drawing.Point(105, 21)
+    $script:txtDiscNewPassword.Size = New-Object System.Drawing.Size(120, 23)
+    $script:txtDiscNewPassword.UseSystemPasswordChar = $true
+    $grpPwd.Controls.Add($script:txtDiscNewPassword)
+
+    $lblEnable = New-Object System.Windows.Forms.Label
+    $lblEnable.Text = "Enable Pwd:"
+    $lblEnable.Location = New-Object System.Drawing.Point(240, 24)
+    $lblEnable.AutoSize = $true
+    $grpPwd.Controls.Add($lblEnable)
+    $script:txtDiscNewEnable = New-Object System.Windows.Forms.TextBox
+    $script:txtDiscNewEnable.Location = New-Object System.Drawing.Point(325, 21)
+    $script:txtDiscNewEnable.Size = New-Object System.Drawing.Size(110, 23)
+    $script:txtDiscNewEnable.UseSystemPasswordChar = $true
+    $grpPwd.Controls.Add($script:txtDiscNewEnable)
+
+    # -- Action buttons --
+    $script:btnDiscApplyIP = New-Object System.Windows.Forms.Button
+    $script:btnDiscApplyIP.Text = "Apply IP Config"
+    $script:btnDiscApplyIP.Location = New-Object System.Drawing.Point(12, 192)
+    $script:btnDiscApplyIP.Size = New-Object System.Drawing.Size(110, 30)
+    $dlg.Controls.Add($script:btnDiscApplyIP)
+
+    $script:btnDiscFlashLED = New-Object System.Windows.Forms.Button
+    $currentSignalState = $row.Cells["Signal"].Value
+    $script:btnDiscFlashLED.Text = if ($currentSignalState) { "Stop LED" } else { "Flash LED" }
+    $script:btnDiscFlashLED.Location = New-Object System.Drawing.Point(130, 192)
+    $script:btnDiscFlashLED.Size = New-Object System.Drawing.Size(85, 30)
+    $dlg.Controls.Add($script:btnDiscFlashLED)
+
+    $script:btnDiscOpenWeb = New-Object System.Windows.Forms.Button
+    $script:btnDiscOpenWeb.Text = "Open Web UI"
+    $script:btnDiscOpenWeb.Location = New-Object System.Drawing.Point(223, 192)
+    $script:btnDiscOpenWeb.Size = New-Object System.Drawing.Size(100, 30)
+    $dlg.Controls.Add($script:btnDiscOpenWeb)
+
+    $script:btnDiscChangePwd = New-Object System.Windows.Forms.Button
+    $script:btnDiscChangePwd.Text = "Change Password"
+    $script:btnDiscChangePwd.Location = New-Object System.Drawing.Point(331, 192)
+    $script:btnDiscChangePwd.Size = New-Object System.Drawing.Size(128, 30)
+    $dlg.Controls.Add($script:btnDiscChangePwd)
+
+    # Wire button handlers
+    $script:btnDiscApplyIP.Add_Click({ Invoke-DiscApplyIP })
+    $script:btnDiscFlashLED.Add_Click({ Invoke-DiscFlashLED })
+    $script:btnDiscOpenWeb.Add_Click({ Invoke-DiscOpenWeb })
+    $script:btnDiscChangePwd.Add_Click({ Invoke-DiscChangePwd })
+
+    # -- Close button --
+    $btnClose = New-Object System.Windows.Forms.Button
+    $btnClose.Text = "Close"
+    $btnClose.Location = New-Object System.Drawing.Point(12, 235)
+    $btnClose.Size = New-Object System.Drawing.Size(448, 30)
+    $btnClose.Add_Click({ $dlg.Close() })
+    $dlg.Controls.Add($btnClose)
+    $dlg.CancelButton = $btnClose
+
+    # Store dialog reference
+    $script:discManageForm = $dlg
+
+    $dlg.ShowDialog($form)
+    $script:discManageForm = $null
 })
 
 # ---------------------------------------------------------------------------
@@ -2772,6 +2910,28 @@ $uiTimer.Add_Tick({
             $row.Cells["Serial"].Value = $dev.Serial
         }
         $lblDiscStatus.Text = "Found $($sync.DiscoveryResults.Count) device(s)."
+
+        # Show success popup after IP config change + re-scan
+        if ($sync.DiscIPApplied) {
+            $sync.DiscIPApplied = $false
+            [System.Windows.Forms.MessageBox]::Show(
+                "IP configuration applied successfully.`nThe device list has been refreshed.",
+                "IP Changed",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Information
+            )
+        }
+
+        # Show success popup after password change + re-scan
+        if ($sync.DiscPwdChanged) {
+            $sync.DiscPwdChanged = $false
+            [System.Windows.Forms.MessageBox]::Show(
+                "Password changed successfully.`nThe device list has been refreshed.",
+                "Password Changed",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Information
+            )
+        }
     }
 
     # Process Discovery log entries
@@ -3330,6 +3490,66 @@ $btnRemoveCred.Add_Click({
         $script:credentials.RemoveAt($idx)
         $dgvCreds.Rows.RemoveAt($idx)
     }
+
+    # Auto-save credentials
+    try { Export-EncryptedCredentials -Credentials $script:credentials -FilePath $script:credFilePath } catch {}
+})
+
+# -- Credential Move Up --
+$btnMoveUp.Add_Click({
+    if ($dgvCreds.SelectedRows.Count -ne 1) { return }
+    $idx = $dgvCreds.SelectedRows[0].Index
+    if ($idx -le 0) { return }
+
+    # Swap in credentials list
+    $temp = $script:credentials[$idx]
+    $script:credentials[$idx] = $script:credentials[$idx - 1]
+    $script:credentials[$idx - 1] = $temp
+
+    # Refresh grid display
+    $dgvCreds.Rows.Clear()
+    foreach ($cred in $script:credentials) {
+        if ($script:showPasswords) {
+            $displayPass = $cred.Password
+            $displayEnable = $cred.EnablePassword
+        } else {
+            $displayPass = if ($cred.Password.Length -gt 0) { "*" * [Math]::Min($cred.Password.Length, 8) } else { "" }
+            $displayEnable = if ($cred.EnablePassword.Length -gt 0) { "*" * [Math]::Min($cred.EnablePassword.Length, 8) } else { "" }
+        }
+        $dgvCreds.Rows.Add($cred.Username, $displayPass, $displayEnable) | Out-Null
+    }
+    $dgvCreds.ClearSelection()
+    $dgvCreds.Rows[$idx - 1].Selected = $true
+
+    # Auto-save credentials
+    try { Export-EncryptedCredentials -Credentials $script:credentials -FilePath $script:credFilePath } catch {}
+})
+
+# -- Credential Move Down --
+$btnMoveDown.Add_Click({
+    if ($dgvCreds.SelectedRows.Count -ne 1) { return }
+    $idx = $dgvCreds.SelectedRows[0].Index
+    if ($idx -ge ($dgvCreds.Rows.Count - 1)) { return }
+
+    # Swap in credentials list
+    $temp = $script:credentials[$idx]
+    $script:credentials[$idx] = $script:credentials[$idx + 1]
+    $script:credentials[$idx + 1] = $temp
+
+    # Refresh grid display
+    $dgvCreds.Rows.Clear()
+    foreach ($cred in $script:credentials) {
+        if ($script:showPasswords) {
+            $displayPass = $cred.Password
+            $displayEnable = $cred.EnablePassword
+        } else {
+            $displayPass = if ($cred.Password.Length -gt 0) { "*" * [Math]::Min($cred.Password.Length, 8) } else { "" }
+            $displayEnable = if ($cred.EnablePassword.Length -gt 0) { "*" * [Math]::Min($cred.EnablePassword.Length, 8) } else { "" }
+        }
+        $dgvCreds.Rows.Add($cred.Username, $displayPass, $displayEnable) | Out-Null
+    }
+    $dgvCreds.ClearSelection()
+    $dgvCreds.Rows[$idx + 1].Selected = $true
 
     # Auto-save credentials
     try { Export-EncryptedCredentials -Credentials $script:credentials -FilePath $script:credFilePath } catch {}
@@ -4841,19 +5061,19 @@ $btnDiscStop.Add_Click({
     $lblDiscStatus.Text = "Cancelling..."
 })
 
-# -- Discovery: Apply IP Config via HiDiscovery v2 multicast SET --
-$btnDiscApplyIP.Add_Click({
-    if ($dgvDiscovery.SelectedRows.Count -eq 0) {
-        [System.Windows.Forms.MessageBox]::Show("Select a device in the grid first.", "No Selection")
-        return
-    }
+# -- Discovery button handlers are wired dynamically in CellDoubleClick above --
+# -- These script-level functions perform the actual operations --
+$script:ledSignalOn = $false
+
+function Invoke-DiscApplyIP {
+    if ($dgvDiscovery.SelectedRows.Count -eq 0) { return }
     $row = $dgvDiscovery.SelectedRows[0]
     $deviceIP = $row.Cells["IPAddress"].Value
     $deviceSerial = $row.Cells["Serial"].Value
-    $newIP = $txtDiscNewIP.Text.Trim()
-    $newMask = $txtDiscNewMask.Text.Trim()
-    $newGateway = $txtDiscNewGateway.Text.Trim()
-    $newName = $txtDiscNewName.Text.Trim()
+    $newIP = $script:txtDiscNewIP.Text.Trim()
+    $newMask = $script:txtDiscNewMask.Text.Trim()
+    $newGateway = $script:txtDiscNewGateway.Text.Trim()
+    $newName = $script:txtDiscNewName.Text.Trim()
 
     if (-not $newIP -and -not $newName) {
         [System.Windows.Forms.MessageBox]::Show("Enter at least a new IP address or device name.", "Input Required")
@@ -4875,30 +5095,20 @@ $btnDiscApplyIP.Add_Click({
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $rtbDiscLog.AppendText("[$timestamp] Applying HiDiscovery v2 config to $deviceIP (serial: $deviceSerial)...`n")
 
-    # Build multicast SNMP SET packet matching HiView's format
-    # HiView sends: Serial (key), CfgStatus=1, IP (as OCTET STRING), HDP=1, Action=2
-    # IP must be OCTET STRING (0x04), NOT IpAddress (0x40) — confirmed from pcap
     $varbinds = [byte[]]@()
-    # Serial number (identifier — required to target the specific device)
     $varbinds += Build-SnmpVarbind -Oid "1.3.6.1.4.1.248.16.100.2.1.0" -ValueTlv (Build-BerOctetString -Value $deviceSerial)
-    # Config status = 1 (configured)
     $varbinds += Build-SnmpVarbind -Oid "1.3.6.1.4.1.248.16.100.2.3.0" -ValueTlv (Build-BerInteger -Value 1)
-    # IP Address (as OCTET STRING — 4 raw bytes, matching HiView)
     if ($newIP) {
         $varbinds += Build-SnmpVarbind -Oid "1.3.6.1.4.1.248.16.100.2.4.0" -ValueTlv (Build-BerIpAsOctetString -IP $newIP)
     }
-    # Netmask as prefix length (Gauge32)
     if ($newMask) {
         $prefix = MaskToPrefix -Mask $newMask
         $varbinds += Build-SnmpVarbind -Oid "1.3.6.1.4.1.248.16.100.2.5.0" -ValueTlv (Build-BerGauge32 -Value $prefix)
     }
-    # Gateway (as OCTET STRING — 4 raw bytes, same as IP)
     if ($newGateway) {
         $varbinds += Build-SnmpVarbind -Oid "1.3.6.1.4.1.248.16.100.2.7.0" -ValueTlv (Build-BerIpAsOctetString -IP $newGateway)
     }
-    # HDP enabled = 1
     $varbinds += Build-SnmpVarbind -Oid "1.3.6.1.4.1.248.16.100.2.2.0" -ValueTlv (Build-BerInteger -Value 1)
-    # Action trigger = 2 (apply)
     $varbinds += Build-SnmpVarbind -Oid "1.3.6.1.4.1.248.16.100.2.8.0" -ValueTlv (Build-BerInteger -Value 2)
 
     $varbindList = Build-BerSequence -Content $varbinds
@@ -4907,14 +5117,13 @@ $btnDiscApplyIP.Add_Click({
     $errorIndexBer = Build-BerInteger -Value 0
     $pduContent = $reqIdBer + $errorStatusBer + $errorIndexBer + $varbindList
     $pduLenBytes = ConvertTo-BerLength -Length $pduContent.Count
-    $pdu = [byte[]]@(0xA3) + $pduLenBytes + $pduContent  # SetRequest
+    $pdu = [byte[]]@(0xA3) + $pduLenBytes + $pduContent
 
     $versionBer = Build-BerInteger -Value 1
     $communityBer = Build-BerOctetString -Value "@discover@"
     $messageContent = $versionBer + $communityBer + $pdu
     $setPacket = Build-BerSequence -Content $messageContent
 
-    # Send via multicast (same as HiView does)
     try {
         $localIP = "0.0.0.0"
         if ($cboDiscNic.SelectedIndex -ge 0 -and $cboDiscNic.Tag -and $cboDiscNic.Tag.Count -gt $cboDiscNic.SelectedIndex) {
@@ -4930,82 +5139,40 @@ $btnDiscApplyIP.Add_Click({
         $udp.Close()
 
         $rtbDiscLog.AppendText("[$timestamp]   SET packet sent via multicast ($($setPacket.Length) bytes)`n")
-        $rtbDiscLog.AppendText("[$timestamp]   Configuration applied. Re-scan to verify changes.`n")
+        $rtbDiscLog.AppendText("[$timestamp]   Configuration applied. Re-scanning...`n")
+        $rtbDiscLog.ScrollToCaret()
+
+        # Close the popup dialog
+        if ($script:discManageForm) { $script:discManageForm.Close() }
+
+        # Set flag so timer shows success popup after re-scan
+        $sync.DiscIPApplied = $true
+
+        # Brief delay to let the switch process the config change
+        Start-Sleep -Milliseconds 1500
+
+        # Trigger a re-scan
+        $btnDiscScan.PerformClick()
     } catch {
         $rtbDiscLog.AppendText("[$timestamp]   ERROR sending SET: $($_.Exception.Message)`n")
+        $rtbDiscLog.ScrollToCaret()
     }
-    $rtbDiscLog.ScrollToCaret()
-})
+}
 
-# -- Discovery: Flash LED via HiDiscovery v2 multicast (toggle on/off) --
-$script:ledSignalOn = $false
-$btnDiscFlashLED.Add_Click({
-    if ($dgvDiscovery.SelectedRows.Count -eq 0) {
-        [System.Windows.Forms.MessageBox]::Show("Select a device in the grid first.", "No Selection")
-        return
-    }
+function Invoke-DiscFlashLED {
+    if ($dgvDiscovery.SelectedRows.Count -eq 0) { return }
     $row = $dgvDiscovery.SelectedRows[0]
-    $deviceIP = $row.Cells["IPAddress"].Value
-    $deviceSerial = $row.Cells["Serial"].Value
+    $currentSignal = $row.Cells["Signal"].Value
 
-    if (-not $deviceSerial) {
-        [System.Windows.Forms.MessageBox]::Show("Device serial number not available.", "Error")
-        return
-    }
+    # Toggle the grid checkbox — the CellValueChanged handler sends the SNMP packet
+    $row.Cells["Signal"].Value = -not $currentSignal
 
-    # Toggle: 1 = signal on, 2 = signal off
-    $signalValue = if ($script:ledSignalOn) { 2 } else { 1 }
-    $action = if ($script:ledSignalOn) { "Stopping" } else { "Starting" }
+    # Update the popup button text to match
+    $script:btnDiscFlashLED.Text = if ($row.Cells["Signal"].Value) { "Stop LED" } else { "Flash LED" }
+}
 
-    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $rtbDiscLog.AppendText("[$timestamp] $action LED signal on $deviceIP...`n")
-
-    # HiDiscovery v2 signal: SET OID .2.9.0 via multicast with serial as key
-    $varbinds = [byte[]]@()
-    $varbinds += Build-SnmpVarbind -Oid "1.3.6.1.4.1.248.16.100.2.1.0" -ValueTlv (Build-BerOctetString -Value $deviceSerial)
-    $varbinds += Build-SnmpVarbind -Oid "1.3.6.1.4.1.248.16.100.2.9.0" -ValueTlv (Build-BerInteger -Value $signalValue)
-
-    $varbindList = Build-BerSequence -Content $varbinds
-    $reqIdBer = Build-BerInteger -Value 0
-    $errorStatusBer = Build-BerInteger -Value 0
-    $errorIndexBer = Build-BerInteger -Value 0
-    $pduContent = $reqIdBer + $errorStatusBer + $errorIndexBer + $varbindList
-    $pduLenBytes = ConvertTo-BerLength -Length $pduContent.Count
-    $pdu = [byte[]]@(0xA3) + $pduLenBytes + $pduContent
-    $versionBer = Build-BerInteger -Value 1
-    $communityBer = Build-BerOctetString -Value "@discover@"
-    $messageContent = $versionBer + $communityBer + $pdu
-    $setPacket = Build-BerSequence -Content $messageContent
-
-    try {
-        $localIP = "0.0.0.0"
-        if ($cboDiscNic.SelectedIndex -ge 0 -and $cboDiscNic.Tag -and $cboDiscNic.Tag.Count -gt $cboDiscNic.SelectedIndex) {
-            $nicInfo = $cboDiscNic.Tag[$cboDiscNic.SelectedIndex]
-            if ($nicInfo.IP) { $localIP = $nicInfo.IP }
-        }
-
-        $udp = New-Object System.Net.Sockets.UdpClient
-        $localEP = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Parse($localIP), 0)
-        $udp.Client.Bind($localEP)
-        $mcastEP = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Parse("239.255.16.12"), 51973)
-        $null = $udp.Send($setPacket, $setPacket.Length, $mcastEP)
-        $udp.Close()
-
-        $script:ledSignalOn = -not $script:ledSignalOn
-        $btnDiscFlashLED.Text = if ($script:ledSignalOn) { "Stop LED" } else { "Flash LED" }
-        $rtbDiscLog.AppendText("[$timestamp]   Signal sent ($($setPacket.Length) bytes)`n")
-    } catch {
-        $rtbDiscLog.AppendText("[$timestamp]   ERROR: $($_.Exception.Message)`n")
-    }
-    $rtbDiscLog.ScrollToCaret()
-})
-
-# -- Discovery: Open Web UI --
-$btnDiscOpenWeb.Add_Click({
-    if ($dgvDiscovery.SelectedRows.Count -eq 0) {
-        [System.Windows.Forms.MessageBox]::Show("Select a device in the grid first.", "No Selection")
-        return
-    }
+function Invoke-DiscOpenWeb {
+    if ($dgvDiscovery.SelectedRows.Count -eq 0) { return }
     $row = $dgvDiscovery.SelectedRows[0]
     $deviceIP = $row.Cells["IPAddress"].Value
     if ($deviceIP) {
@@ -5014,18 +5181,14 @@ $btnDiscOpenWeb.Add_Click({
         $rtbDiscLog.ScrollToCaret()
         Start-Process "http://$deviceIP"
     }
-})
+}
 
-# -- Discovery: Change Password via SSH --
-$btnDiscChangePwd.Add_Click({
-    if ($dgvDiscovery.SelectedRows.Count -eq 0) {
-        [System.Windows.Forms.MessageBox]::Show("Select a device in the grid first.", "No Selection")
-        return
-    }
+function Invoke-DiscChangePwd {
+    if ($dgvDiscovery.SelectedRows.Count -eq 0) { return }
     $row = $dgvDiscovery.SelectedRows[0]
     $deviceIP = $row.Cells["IPAddress"].Value
-    $newPwd = $txtDiscNewPassword.Text
-    $newEnable = $txtDiscNewEnable.Text
+    $newPwd = $script:txtDiscNewPassword.Text
+    $newEnable = $script:txtDiscNewEnable.Text
 
     if (-not $newPwd -and -not $newEnable) {
         [System.Windows.Forms.MessageBox]::Show("Enter a new password or enable password.", "Input Required")
@@ -5054,7 +5217,6 @@ $btnDiscChangePwd.Add_Click({
     $rtbDiscLog.AppendText("[$timestamp] Changing password on $deviceIP...`n")
     $rtbDiscLog.ScrollToCaret()
 
-    # Get host key
     $hostKey = Get-PlinkHostKey -PlinkPath $plinkPath -IP $deviceIP
     if (-not $hostKey) {
         $rtbDiscLog.AppendText("[$timestamp]   ERROR: Could not get SSH host key.`n")
@@ -5062,13 +5224,7 @@ $btnDiscChangePwd.Add_Click({
         return
     }
 
-    # Hirschmann factory-default behavior: SSH login with admin/private triggers
-    # interactive "Enter new password:" + "Confirm new password:" prompts.
-    # IMPORTANT: Must use Write("pwd\n") NOT WriteLine("pwd") — PTY converts \r\n
-    # from WriteLine into double newlines, causing empty confirmation.
     $success = $false
-
-    # Build credential list: saved credentials + factory default
     $credList = @()
     foreach ($cred in $script:credentials) {
         $credList += @{ Username = $cred.Username; Password = $cred.Password }
@@ -5095,20 +5251,16 @@ $btnDiscChangePwd.Add_Click({
             $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
             $stderrTask = $proc.StandardError.ReadToEndAsync()
 
-            # Wait for banner + "Enter new password:" prompt
             Start-Sleep -Milliseconds 5000
 
-            # Send new password (Write + \n, NOT WriteLine which sends \r\n)
             $proc.StandardInput.Write("$newPwd`n")
             $proc.StandardInput.Flush()
             Start-Sleep -Milliseconds 2000
 
-            # Send confirmation
             $proc.StandardInput.Write("$newPwd`n")
             $proc.StandardInput.Flush()
             Start-Sleep -Milliseconds 3000
 
-            # Exit session
             $proc.StandardInput.Write("exit`n")
             $proc.StandardInput.Flush()
             Start-Sleep -Milliseconds 1000
@@ -5124,6 +5276,17 @@ $btnDiscChangePwd.Add_Click({
             if ($stdout -match 'Password changed') {
                 $success = $true
                 $rtbDiscLog.AppendText("[$timestamp]   Password changed successfully on $deviceIP`n")
+                $rtbDiscLog.ScrollToCaret()
+
+                # Close the popup dialog
+                if ($script:discManageForm) { $script:discManageForm.Close() }
+
+                # Set flag so timer shows success popup after re-scan
+                $sync.DiscPwdChanged = $true
+
+                # Brief delay then re-scan
+                Start-Sleep -Milliseconds 1500
+                $btnDiscScan.PerformClick()
                 break
             } elseif ($stdout -match 'Access denied' -or $stderr -match 'Access denied') {
                 $rtbDiscLog.AppendText("[$timestamp]   Auth failed with $($cred.Username)`n")
@@ -5137,9 +5300,20 @@ $btnDiscChangePwd.Add_Click({
 
     if (-not $success) {
         $rtbDiscLog.AppendText("[$timestamp]   ERROR: Failed to change password. Ensure the switch has factory default credentials (admin/private).`n")
+        $rtbDiscLog.ScrollToCaret()
+
+        if ($script:discManageForm) { $script:discManageForm.Close() }
+
+        [System.Windows.Forms.MessageBox]::Show(
+            "Failed to change password on $deviceIP.`n`nCheck the Discovery log below for more detail.",
+            "Password Change Failed",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Error
+        )
+        return
     }
     $rtbDiscLog.ScrollToCaret()
-})
+}
 
 # -- Form Closing: cleanup --
 $form.Add_FormClosing({
