@@ -42,6 +42,26 @@ function ConvertFrom-CIDR {
     return $ips
 }
 
+function Load-ScanHistory {
+    $histFile = Join-Path $PSScriptRoot "scan_history.json"
+    if (Test-Path $histFile) {
+        try {
+            $json = Get-Content $histFile -Raw | ConvertFrom-Json
+            if ($json -is [array]) { return @($json) }
+            return @($json)
+        } catch { return @() }
+    }
+    return @()
+}
+
+function Save-ScanHistory {
+    param([string[]]$History)
+    $histFile = Join-Path $PSScriptRoot "scan_history.json"
+    try {
+        $History | ConvertTo-Json | Set-Content $histFile -Force
+    } catch {}
+}
+
 function Test-TCPPort {
     param([string]$IP, [int]$Port = 22, [int]$Timeout = 1000)
     try {
@@ -1043,6 +1063,21 @@ function Clean-CiscoOutput {
     return ($cleaned -join "`n").Trim()
 }
 
+function Clean-MoxaOutput {
+    param([string]$RawOutput)
+    $lines = $RawOutput -split "`n"
+    $cleaned = @()
+    foreach ($line in $lines) {
+        $trimmed = $line.TrimEnd("`r")
+        # Strip --More-- pagination artifacts and ANSI escape codes
+        $trimmed = $trimmed -replace '\x1b\[[0-9;]*[a-zA-Z]', ''
+        $trimmed = $trimmed -replace '--More--\s*', ''
+        if ($trimmed -match '^\s*$' -and $cleaned.Count -eq 0) { continue }
+        $cleaned += $trimmed
+    }
+    return ($cleaned -join "`n").Trim()
+}
+
 function Clean-AnsiOutput {
     param([string]$RawOutput)
     $cleaned = $RawOutput -replace '\x1b\[[0-9;]*[a-zA-Z]', ''
@@ -1220,7 +1255,7 @@ $script:sharedISS = [System.Management.Automation.Runspaces.InitialSessionState]
 $sharedFunctionNames = @(
     'Build-PlinkArgs', 'Get-PlinkHostKey', 'Invoke-PlinkCommand',
     'Invoke-PlinkInteractive', 'Sanitize-Filename',
-    'Clean-HirschmannOutput', 'Clean-CiscoOutput', 'Clean-AnsiOutput',
+    'Clean-HirschmannOutput', 'Clean-CiscoOutput', 'Clean-MoxaOutput', 'Clean-AnsiOutput',
     'Add-SyncLog', 'PrefixToMask'
 )
 foreach ($funcName in $sharedFunctionNames) {
@@ -1487,33 +1522,56 @@ $panelScanTop.Dock = 'Top'
 $panelScanTop.Height = 165
 $tabScan.Controls.Add($panelScanTop)
 
-$lblSubnet = New-Object System.Windows.Forms.Label
-$lblSubnet.Text = "Subnet (CIDR):"
-$lblSubnet.Location = New-Object System.Drawing.Point(5, 12)
-$lblSubnet.AutoSize = $true
-$panelScanTop.Controls.Add($lblSubnet)
+$lblNetwork = New-Object System.Windows.Forms.Label
+$lblNetwork.Text = "Network:"
+$lblNetwork.Location = New-Object System.Drawing.Point(5, 12)
+$lblNetwork.AutoSize = $true
+$panelScanTop.Controls.Add($lblNetwork)
 
-$txtSubnet = New-Object System.Windows.Forms.TextBox
-$txtSubnet.Location = New-Object System.Drawing.Point(110, 9)
-$txtSubnet.Size = New-Object System.Drawing.Size(200, 23)
-$txtSubnet.Text = "192.168.105.0/24"
-$panelScanTop.Controls.Add($txtSubnet)
+$cboNetwork = New-Object System.Windows.Forms.ComboBox
+$cboNetwork.DropDownStyle = 'DropDown'
+$cboNetwork.Location = New-Object System.Drawing.Point(70, 9)
+$cboNetwork.Size = New-Object System.Drawing.Size(180, 23)
+$panelScanTop.Controls.Add($cboNetwork)
+
+# Load history into network combo
+$script:scanHistory = Load-ScanHistory
+foreach ($h in $script:scanHistory) { $null = $cboNetwork.Items.Add($h) }
+if ($cboNetwork.Items.Count -gt 0) { $cboNetwork.SelectedIndex = 0 }
+
+$lblMask = New-Object System.Windows.Forms.Label
+$lblMask.Text = "Mask:"
+$lblMask.Location = New-Object System.Drawing.Point(258, 12)
+$lblMask.AutoSize = $true
+$panelScanTop.Controls.Add($lblMask)
+
+$cboMask = New-Object System.Windows.Forms.ComboBox
+$cboMask.DropDownStyle = 'DropDownList'
+$cboMask.Location = New-Object System.Drawing.Point(295, 9)
+$cboMask.Size = New-Object System.Drawing.Size(180, 23)
+for ($p = 1; $p -le 30; $p++) {
+    $mask = PrefixToMask -Prefix $p
+    $null = $cboMask.Items.Add("/$p - $mask")
+}
+# Default to /24
+$cboMask.SelectedIndex = 23
+$panelScanTop.Controls.Add($cboMask)
 
 $btnScan = New-Object System.Windows.Forms.Button
 $btnScan.Text = "Scan"
-$btnScan.Location = New-Object System.Drawing.Point(320, 7)
+$btnScan.Location = New-Object System.Drawing.Point(485, 7)
 $btnScan.Size = New-Object System.Drawing.Size(80, 27)
 $panelScanTop.Controls.Add($btnScan)
 
 $btnScanStop = New-Object System.Windows.Forms.Button
 $btnScanStop.Text = "Stop"
-$btnScanStop.Location = New-Object System.Drawing.Point(405, 7)
+$btnScanStop.Location = New-Object System.Drawing.Point(570, 7)
 $btnScanStop.Size = New-Object System.Drawing.Size(80, 27)
 $btnScanStop.Enabled = $false
 $panelScanTop.Controls.Add($btnScanStop)
 
 $lblPlinkStatus = New-Object System.Windows.Forms.Label
-$lblPlinkStatus.Location = New-Object System.Drawing.Point(500, 12)
+$lblPlinkStatus.Location = New-Object System.Drawing.Point(665, 12)
 $lblPlinkStatus.AutoSize = $true
 if ($plinkPath) {
     $lblPlinkStatus.Text = "plink: $plinkPath"
@@ -1561,7 +1619,7 @@ $cboVendor = New-Object System.Windows.Forms.ComboBox
 $cboVendor.DropDownStyle = 'DropDownList'
 $cboVendor.Location = New-Object System.Drawing.Point(255, 92)
 $cboVendor.Size = New-Object System.Drawing.Size(120, 23)
-$cboVendor.Items.AddRange(@('Auto-Detect', 'Hirschmann', 'Cisco'))
+$cboVendor.Items.AddRange(@('Auto-Detect', 'Hirschmann', 'Cisco', 'Moxa'))
 $cboVendor.SelectedIndex = 0
 $panelScanTop.Controls.Add($cboVendor)
 
@@ -1588,6 +1646,23 @@ $btnWatchdog.Text = "Start Watchdog"
 $btnWatchdog.Location = New-Object System.Drawing.Point(330, 127)
 $btnWatchdog.Size = New-Object System.Drawing.Size(120, 27)
 $panelScanTop.Controls.Add($btnWatchdog)
+
+$lblAddIP = New-Object System.Windows.Forms.Label
+$lblAddIP.Text = "Add IP:"
+$lblAddIP.Location = New-Object System.Drawing.Point(480, 131)
+$lblAddIP.AutoSize = $true
+$panelScanTop.Controls.Add($lblAddIP)
+
+$txtAddIP = New-Object System.Windows.Forms.TextBox
+$txtAddIP.Location = New-Object System.Drawing.Point(530, 128)
+$txtAddIP.Size = New-Object System.Drawing.Size(120, 23)
+$panelScanTop.Controls.Add($txtAddIP)
+
+$btnAddIP = New-Object System.Windows.Forms.Button
+$btnAddIP.Text = "Add"
+$btnAddIP.Location = New-Object System.Drawing.Point(658, 127)
+$btnAddIP.Size = New-Object System.Drawing.Size(60, 27)
+$panelScanTop.Controls.Add($btnAddIP)
 
 $dgvScan = New-Object System.Windows.Forms.DataGridView
 $dgvScan.Dock = 'Fill'
@@ -1667,7 +1742,15 @@ $ctxSetCisco = New-Object System.Windows.Forms.ToolStripMenuItem
 $ctxSetCisco.Text = "Set Vendor: Cisco"
 $ctxSetAutoDetect = New-Object System.Windows.Forms.ToolStripMenuItem
 $ctxSetAutoDetect.Text = "Set Vendor: Auto-Detect (clear override)"
-$ctxMenuScan.Items.AddRange(@($ctxSetHirschmann, $ctxSetCisco, $ctxSetAutoDetect))
+$ctxSetMoxa = New-Object System.Windows.Forms.ToolStripMenuItem
+$ctxSetMoxa.Text = "Set Vendor: Moxa"
+$ctxScanSeparator = New-Object System.Windows.Forms.ToolStripSeparator
+$ctxOpenHttps = New-Object System.Windows.Forms.ToolStripMenuItem
+$ctxOpenHttps.Text = "Open HTTPS"
+$ctxScanSeparator2 = New-Object System.Windows.Forms.ToolStripSeparator
+$ctxRemoveSelected = New-Object System.Windows.Forms.ToolStripMenuItem
+$ctxRemoveSelected.Text = "Remove Selected"
+$ctxMenuScan.Items.AddRange(@($ctxSetHirschmann, $ctxSetCisco, $ctxSetMoxa, $ctxSetAutoDetect, $ctxScanSeparator, $ctxOpenHttps, $ctxScanSeparator2, $ctxRemoveSelected))
 $dgvScan.ContextMenuStrip = $ctxMenuScan
 
 $ctxSetHirschmann.Add_Click({
@@ -1704,6 +1787,23 @@ $ctxSetCisco.Add_Click({
     }
 })
 
+$ctxSetMoxa.Add_Click({
+    foreach ($row in $dgvScan.SelectedRows) {
+        $row.Cells["Type"].Value = "Moxa"
+        $ip = $row.Cells["IP"].Value
+        for ($j = 0; $j -lt $script:devices.Count; $j++) {
+            if ($script:devices[$j].IP -eq $ip) {
+                $script:devices[$j].Type = "Moxa"
+                if (-not $script:devices[$j].Status -or $script:devices[$j].Status -notmatch 'Identified') {
+                    $script:devices[$j].Status = "Identified (Manual: Moxa)"
+                }
+                break
+            }
+        }
+        $row.Cells["Status"].Value = "Identified (Manual: Moxa)"
+    }
+})
+
 $ctxSetAutoDetect.Add_Click({
     foreach ($row in $dgvScan.SelectedRows) {
         $row.Cells["Type"].Value = ""
@@ -1716,6 +1816,35 @@ $ctxSetAutoDetect.Add_Click({
             }
         }
         $row.Cells["Status"].Value = "Vendor cleared - re-identify"
+    }
+})
+
+$ctxOpenHttps.Add_Click({
+    foreach ($row in $dgvScan.SelectedRows) {
+        $ip = $row.Cells["IP"].Value
+        if ($ip) {
+            Start-Process "https://$ip"
+        }
+    }
+})
+
+$ctxRemoveSelected.Add_Click({
+    if ($dgvScan.SelectedRows.Count -eq 0) { return }
+    # Collect IPs to remove, then remove rows in reverse order to avoid index shift
+    $rowsToRemove = @()
+    foreach ($row in $dgvScan.SelectedRows) {
+        $rowsToRemove += $row
+    }
+    foreach ($row in $rowsToRemove) {
+        $ip = $row.Cells["IP"].Value
+        # Remove from devices list
+        for ($j = $script:devices.Count - 1; $j -ge 0; $j--) {
+            if ($script:devices[$j].IP -eq $ip) {
+                $script:devices.RemoveAt($j)
+                break
+            }
+        }
+        $dgvScan.Rows.Remove($row)
     }
 })
 
@@ -2963,16 +3092,32 @@ $cboVendor.Add_SelectedIndexChanged({
 
 # -- Scan button --
 $btnScan.Add_Click({
-    $cidr = $txtSubnet.Text.Trim()
-    if (-not $cidr) {
-        [System.Windows.Forms.MessageBox]::Show("Please enter a subnet in CIDR notation.", "Input Required")
+    $networkAddr = $cboNetwork.Text.Trim()
+    if (-not $networkAddr) {
+        [System.Windows.Forms.MessageBox]::Show("Please enter a network address.", "Input Required")
         return
     }
+    if ($cboMask.SelectedIndex -lt 0) {
+        [System.Windows.Forms.MessageBox]::Show("Please select a subnet mask.", "Input Required")
+        return
+    }
+    # Extract prefix number from mask selection (format: "/24 - 255.255.255.0")
+    $maskText = $cboMask.SelectedItem.ToString()
+    $prefix = $maskText.Split(' ')[0].TrimStart('/')
+
+    $cidr = "$networkAddr/$prefix"
     $ips = ConvertFrom-CIDR $cidr
     if ($ips.Count -eq 0) {
-        [System.Windows.Forms.MessageBox]::Show("Invalid CIDR notation or no host IPs in range.", "Error")
+        [System.Windows.Forms.MessageBox]::Show("Invalid network address or mask. Check your input.", "Error")
         return
     }
+
+    # Save network address to history (most recent first, max 10, no duplicates)
+    $script:scanHistory = @($networkAddr) + @($script:scanHistory | Where-Object { $_ -ne $networkAddr }) | Select-Object -First 10
+    Save-ScanHistory -History $script:scanHistory
+    $cboNetwork.Items.Clear()
+    foreach ($h in $script:scanHistory) { $null = $cboNetwork.Items.Add($h) }
+    $cboNetwork.Text = $networkAddr
 
     # Stop watchdog if running, since the grid is about to be cleared
     if ($script:watchdogRunning) {
@@ -3107,6 +3252,42 @@ $btnSelectAll.Add_Click({
 })
 $btnSelectNone.Add_Click({
     foreach ($row in $dgvScan.Rows) { $row.Cells["Selected"].Value = $false }
+})
+
+# -- Add IP manually --
+$btnAddIP.Add_Click({
+    $ipText = $txtAddIP.Text.Trim()
+    if (-not $ipText) {
+        [System.Windows.Forms.MessageBox]::Show("Please enter an IP address.", "Input Required")
+        return
+    }
+    $parsedIP = $null
+    if (-not [System.Net.IPAddress]::TryParse($ipText, [ref]$parsedIP)) {
+        [System.Windows.Forms.MessageBox]::Show("'$ipText' is not a valid IP address.", "Invalid IP")
+        return
+    }
+    # Check for duplicate
+    foreach ($row in $dgvScan.Rows) {
+        if ($row.Cells["IP"].Value -eq $ipText) {
+            [System.Windows.Forms.MessageBox]::Show("$ipText is already in the list.", "Duplicate")
+            return
+        }
+    }
+    # Add to grid
+    $idx = $dgvScan.Rows.Add($true, "?", $ipText, "", "", "", "", "Manual Entry")
+    $dgvScan.Rows[$idx].Cells["Ping"].Style.ForeColor = [System.Drawing.Color]::Gray
+    $dgvScan.Rows[$idx].Cells["Ping"].Style.SelectionForeColor = [System.Drawing.Color]::Gray
+    # Add to devices list
+    $null = $script:devices.Add(@{
+        IP       = $ipText
+        Port     = ""
+        Type     = ""
+        Hostname = ""
+        Model    = ""
+        Status   = "Manual Entry"
+        ConnectionMethod = $script:connectionMethod
+    })
+    $txtAddIP.Text = ""
 })
 
 # -- Watchdog Toggle --
@@ -3284,6 +3465,8 @@ $btnIdentify.Add_Click({
                     $resp = Invoke-PlinkCommand -PlinkPath $PlinkPath -IP $ip -Username $cred.Username -Password $cred.Password -HostKey $hostKey -Commands @("exit") -Method $ConnMethod -SerialSettings $SerialSettings
 
                     $combined = "$($resp.StdOut)`n$($resp.StdErr)"
+                    # Normalize wide-char (UTF-16) output: strip null bytes
+                    $combined = $combined -replace '\x00', ''
 
                     # Auth failure check
                     if ($combined -match 'Access denied' -or $combined -match 'FATAL ERROR.*password' -or
@@ -3358,6 +3541,57 @@ $btnIdentify.Add_Click({
                         break
                     }
 
+                    # Moxa detection (Auto-Detect mode)
+                    if ($combined -match 'Moxa' -or $combined -match 'MXview' -or $combined -match 'EDS-' -or $combined -match 'IKS-' -or $combined -match 'SDS-') {
+                        $deviceResult.Type = "Moxa"
+                        $deviceResult.Username = $cred.Username
+                        $deviceResult.Password = $cred.Password
+                        $deviceResult.EnablePassword = $cred.EnablePassword
+                        $deviceResult.Status = "Identified"
+
+                        # Extract model from banner if present
+                        if ($combined -match '(EDS-\S+|IKS-\S+|SDS-\S+|EDR-\S+|PT-\S+|AWK-\S+)') {
+                            $deviceResult.Model = $Matches[1].Trim()
+                        }
+                        if ($combined -match '(\S+)[#>]\s*$') {
+                            $deviceResult.Hostname = $Matches[1].Trim()
+                        }
+
+                        # Probe with 'show running-config' — header comments contain model/firmware
+                        $moxaProbeCmds = @("show running-config", (" " * 200), (" " * 200), (" " * 200), "exit")
+                        $moxaProbeResp = Invoke-PlinkInteractive -PlinkPath $PlinkPath -IP $ip `
+                            -Username $cred.Username -Password $cred.Password -HostKey $hostKey `
+                            -Commands $moxaProbeCmds -Timeout 20000 -ReadDelay 5000 -Method $ConnMethod -SerialSettings $SerialSettings
+                        $moxaProbeRaw = "$($moxaProbeResp.StdOut)`n$($moxaProbeResp.StdErr)"
+                        # Normalize wide-char (UTF-16) output: strip null bytes
+                        $moxaProbeOut = $moxaProbeRaw -replace '\x00', ''
+
+                        # Log probe output for troubleshooting
+                        try { $moxaProbeOut | Out-File -FilePath "$env:TEMP\moxa_probe_$($ip -replace '\.','_').txt" -Force } catch {}
+
+                        # Extract model from "! Model name: EDS-4012-8P-4GS" comment line
+                        if (-not $deviceResult.Model) {
+                            if ($moxaProbeOut -match '!\s*[Mm]odel\s*[Nn]ame\s*:\s*(.+)') {
+                                $deviceResult.Model = $Matches[1].Trim()
+                            } elseif ($moxaProbeOut -match '(EDS-\S+|IKS-\S+|SDS-\S+|EDR-\S+|PT-\S+|AWK-\S+|TN-\S+|IM-\S+|MGS-\S+|MDS-\S+)') {
+                                $deviceResult.Model = $Matches[1].Trim()
+                            }
+                        }
+
+                        # Append firmware version from "! Firmware version: v4.1"
+                        if ($moxaProbeOut -match '!\s*[Ff]irmware\s*[Vv]ersion\s*:\s*(\S+)') {
+                            $deviceResult.Model = "$($deviceResult.Model) FW $($Matches[1].Trim())".Trim()
+                        }
+
+                        # Extract hostname from probe if banner didn't have it
+                        if (-not $deviceResult.Hostname) {
+                            if ($moxaProbeOut -match '(\S+)[#>]\s') {
+                                $deviceResult.Hostname = $Matches[1].Trim()
+                            }
+                        }
+                        break
+                    }
+
                     # Cisco detection (Auto-Detect mode)
                     if ($combined -match 'Cisco' -or $combined -match 'IOS') {
                         $deviceResult.Type = "Cisco"
@@ -3425,6 +3659,22 @@ $btnIdentify.Add_Click({
                             # Extract firmware version
                             if ($probeOut -match 'Version\s+(\d+\.\d+\S*)') {
                                 $deviceResult.Model = "$($deviceResult.Model) IOS $($Matches[1].Trim())".Trim()
+                            }
+                            break
+                        }
+
+                        # Moxa detection from probe output
+                        if ($probeOut -match 'Moxa' -or $probeOut -match 'MXview' -or $probeOut -match 'EDS-' -or $probeOut -match 'IKS-' -or $probeOut -match 'SDS-') {
+                            $deviceResult.Type = "Moxa"
+                            $deviceResult.Status = "Identified"
+                            if ($probeOut -match '(\S+)[#>]\s') {
+                                $deviceResult.Hostname = $Matches[1].Trim()
+                            }
+                            if ($probeOut -match '(EDS-\S+|IKS-\S+|SDS-\S+|EDR-\S+|PT-\S+|AWK-\S+)') {
+                                $deviceResult.Model = $Matches[1].Trim()
+                            }
+                            if ($probeOut -match 'Firmware\s+[Vv]ersion\s*[:\s]+(\S+)') {
+                                $deviceResult.Model = "$($deviceResult.Model) FW $($Matches[1].Trim())".Trim()
                             }
                             break
                         }
@@ -3860,6 +4110,13 @@ function Start-Backup {
                     $resp = Invoke-PlinkInteractive -PlinkPath $PlinkPath -IP $ip -Username $username -Password $password -HostKey $hostKey -Commands $commands -Timeout 60000 -ReadDelay 8000 -Method $ConnMethod -SerialSettings $SerialSettings
                     $rawOutput = $resp.StdOut
                     $cleanedConfig = Clean-CiscoOutput -RawOutput $rawOutput
+
+                } elseif ($effectiveType -eq "Moxa") {
+                    Add-SyncLog -SyncHash $SyncHash -Channel "Backup" -Message "  Downloading Moxa config from $ip..."
+                    $commands = @("show running-config", (" " * 200), (" " * 200), (" " * 200), (" " * 200), (" " * 200), "exit")
+                    $resp = Invoke-PlinkInteractive -PlinkPath $PlinkPath -IP $ip -Username $username -Password $password -HostKey $hostKey -Commands $commands -Timeout 60000 -ReadDelay 8000 -Method $ConnMethod -SerialSettings $SerialSettings
+                    $rawOutput = $resp.StdOut
+                    $cleanedConfig = Clean-MoxaOutput -RawOutput $rawOutput
 
                 } else {
                     Add-SyncLog -SyncHash $SyncHash -Channel "Backup" -Message "  Unknown device type for $ip, attempting generic config download..."
@@ -4657,6 +4914,15 @@ $btnAuditRun.Add_Click({
                     foreach ($cmd in $Commands) {
                         $cmdSequence += $cmd
                         # Add spaces to advance past --More-- prompts
+                        $cmdSequence += (" " * 200)
+                        $cmdSequence += (" " * 200)
+                        $cmdSequence += (" " * 200)
+                    }
+                    $cmdSequence += "exit"
+                } elseif ($effectiveType -eq "Moxa") {
+                    # Moxa: send commands with spaces for --More-- pagination
+                    foreach ($cmd in $Commands) {
+                        $cmdSequence += $cmd
                         $cmdSequence += (" " * 200)
                         $cmdSequence += (" " * 200)
                         $cmdSequence += (" " * 200)
