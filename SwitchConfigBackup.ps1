@@ -1094,6 +1094,7 @@ function Add-SyncLog {
         "Backup"    { $SyncHash.BackupLog += $entry }
         "Audit"     { $SyncHash.AuditLog += $entry }
         "Discovery" { $SyncHash.DiscoveryLog += $entry }
+        "Diagram"   { $SyncHash.DiagramLog += $entry }
     }
 }
 
@@ -1116,6 +1117,133 @@ function MaskToPrefix {
         while ($p -gt 0) { $bits += ($p -band 1); $p = $p -shr 1 }
     }
     return $bits
+}
+
+function Normalize-MAC {
+    param([string]$Mac)
+    if (-not $Mac) { return "" }
+    $Mac = $Mac.Trim().ToLower() -replace '[.:\-]',''
+    if ($Mac.Length -eq 12) {
+        return ($Mac -replace '(.{2})','$1:').TrimEnd(':')
+    }
+    return $Mac
+}
+
+function Export-DrawioXml {
+    param(
+        [hashtable]$Devices,
+        [array]$Connections,
+        [string]$FilePath,
+        [hashtable]$DeviceRects = $null
+    )
+
+    # Vendor color map
+    $vendorStyles = @{
+        "Hirschmann" = "rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1;fontSize=11;"
+        "Cisco"      = "rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;fontSize=11;"
+        "Moxa"       = "rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d6b656;fontStyle=1;fontSize=11;"
+        "Unknown"    = "rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontStyle=1;fontSize=11;"
+    }
+    $edgeStyle = "edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;fontSize=9;labelBackgroundColor=#ffffff;"
+
+    # Build device ID map and fallback layout positions (grid: 4 columns, 250px spacing)
+    $devIds = @{}
+    $devIndex = 0
+    $colCount = 4
+    $xSpacing = 250
+    $ySpacing = 120
+    $xOffset = 50
+    $yOffset = 50
+
+    foreach ($key in $Devices.Keys) {
+        $devIds[$key] = "dev_$devIndex"
+        $devIndex++
+    }
+
+    # Determine page size from canvas rects or fallback grid
+    if ($DeviceRects -and $DeviceRects.Count -gt 0) {
+        $maxRight = 0; $maxBottom = 0
+        foreach ($key in $DeviceRects.Keys) {
+            $r = $DeviceRects[$key]
+            $right = $r.X + 180 + 50
+            $bottom = $r.Y + 70 + 50
+            if ($right -gt $maxRight) { $maxRight = $right }
+            if ($bottom -gt $maxBottom) { $maxBottom = $bottom }
+        }
+        $pageW = [Math]::Max(1100, [int]$maxRight)
+        $pageH = [Math]::Max(850, [int]$maxBottom)
+    } else {
+        $pageW = [Math]::Max(1100, ($colCount * $xSpacing) + 200)
+        $pageH = [Math]::Max(850, ([Math]::Ceiling($Devices.Count / $colCount) * $ySpacing) + 200)
+    }
+
+    $sb = New-Object System.Text.StringBuilder
+    $null = $sb.AppendLine('<?xml version="1.0" encoding="UTF-8"?>')
+    $null = $sb.AppendLine('<mxfile host="SwitchConfigBackup" modified="' + (Get-Date -Format "yyyy-MM-ddTHH:mm:ss") + '" version="1.0">')
+    $null = $sb.AppendLine('  <diagram name="Network Topology" id="topology">')
+
+    $null = $sb.AppendLine("    <mxGraphModel dx=`"$pageW`" dy=`"$pageH`" grid=`"1`" gridSize=`"10`" guides=`"1`" tooltips=`"1`" connect=`"1`" arrows=`"1`" fold=`"1`" page=`"1`" pageScale=`"1`" pageWidth=`"$pageW`" pageHeight=`"$pageH`" background=`"#ffffff`">")
+    $null = $sb.AppendLine('      <root>')
+    $null = $sb.AppendLine('        <mxCell id="0"/>')
+    $null = $sb.AppendLine('        <mxCell id="1" parent="0"/>')
+
+    # Add device nodes
+    $i = 0
+    foreach ($key in $Devices.Keys) {
+        $dev = $Devices[$key]
+        $cellId = $devIds[$key]
+
+        # Use canvas positions if available, otherwise fallback to grid layout
+        if ($DeviceRects -and $DeviceRects.ContainsKey($key)) {
+            $x = [int]$DeviceRects[$key].X
+            $y = [int]$DeviceRects[$key].Y
+        } else {
+            $col = $i % $colCount
+            $row = [Math]::Floor($i / $colCount)
+            $x = $xOffset + ($col * $xSpacing)
+            $y = $yOffset + ($row * $ySpacing)
+        }
+
+        $label = [System.Security.SecurityElement]::Escape($dev.Hostname)
+        if ($dev.IP) { $label += "&#10;" + [System.Security.SecurityElement]::Escape($dev.IP) }
+        if ($dev.Type) { $label += "&#10;" + [System.Security.SecurityElement]::Escape($dev.Type) }
+
+        $type = if ($dev.Type -and $vendorStyles.ContainsKey($dev.Type)) { $dev.Type } else { "Unknown" }
+        $style = $vendorStyles[$type]
+        if (-not $dev.Audited) { $style += "dashed=1;" }
+
+        $null = $sb.AppendLine("        <mxCell id=`"$cellId`" value=`"$label`" style=`"$style`" vertex=`"1`" parent=`"1`">")
+        $null = $sb.AppendLine("          <mxGeometry x=`"$x`" y=`"$y`" width=`"180`" height=`"70`" as=`"geometry`"/>")
+        $null = $sb.AppendLine('        </mxCell>')
+        $i++
+    }
+
+    # Add connection edges
+    $connIdx = 0
+    foreach ($conn in $Connections) {
+        $srcId = $devIds[$conn.SrcDevKey]
+        $dstId = $devIds[$conn.DstDevKey]
+        if (-not $srcId -or -not $dstId) { continue }
+
+        $portLabel = ""
+        if ($conn.SrcPort -and $conn.DstPort) {
+            $rawLabel = "$($conn.SrcPort) - $($conn.DstPort)"
+            $portLabel = [System.Security.SecurityElement]::Escape($rawLabel)
+        }
+
+        $null = $sb.AppendLine("        <mxCell id=`"conn_$connIdx`" value=`"$portLabel`" style=`"$edgeStyle`" edge=`"1`" source=`"$srcId`" target=`"$dstId`" parent=`"1`">")
+        $null = $sb.AppendLine('          <mxGeometry relative="1" as="geometry"/>')
+        $null = $sb.AppendLine('        </mxCell>')
+        $connIdx++
+    }
+
+    $null = $sb.AppendLine('      </root>')
+    $null = $sb.AppendLine('    </mxGraphModel>')
+    $null = $sb.AppendLine('  </diagram>')
+    $null = $sb.AppendLine('</mxfile>')
+
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($FilePath, $sb.ToString(), $utf8NoBom)
 }
 
 function Export-EncryptedCredentials {
@@ -1231,6 +1359,12 @@ $sync = [hashtable]::Synchronized(@{
     DiscoveryCancel    = $false
     DiscIPApplied      = $false
     DiscPwdChanged     = $false
+    DiagramLog         = @()
+    DiagramLogIndex    = 0
+    DiagramStatus      = ""
+    DiagramComplete    = $false
+    DiagramDevices     = @{}
+    DiagramConnections = @()
 })
 
 # Store discovered devices
@@ -1240,6 +1374,12 @@ $script:runspacePool = $null
 $script:activeRunspace = $null
 $script:watchdogRunspace = $null
 $script:discoveryRunspace = $null
+$script:diagramRunspace = $null
+$script:diagDeviceRects = @{}
+$script:diagConnections = @()
+$script:diagDragKey = $null
+$script:diagDragOffsetX = 0
+$script:diagDragOffsetY = 0
 $script:watchdogRunning = $false
 $script:showPasswords = $false
 $script:credFilePath = Join-Path $PSScriptRoot "switch_creds.xml"
@@ -1256,7 +1396,7 @@ $sharedFunctionNames = @(
     'Build-PlinkArgs', 'Get-PlinkHostKey', 'Invoke-PlinkCommand',
     'Invoke-PlinkInteractive', 'Sanitize-Filename',
     'Clean-HirschmannOutput', 'Clean-CiscoOutput', 'Clean-MoxaOutput', 'Clean-AnsiOutput',
-    'Add-SyncLog', 'PrefixToMask'
+    'Add-SyncLog', 'PrefixToMask', 'Normalize-MAC'
 )
 foreach ($funcName in $sharedFunctionNames) {
     $funcBody = (Get-Command -Name $funcName -CommandType Function).ScriptBlock.ToString()
@@ -2311,7 +2451,7 @@ $splitAuditRight.Panel2.Controls.Add($rtbAuditLog)
 # Discovery Tab (HiDiscovery / HiView style)
 # ---------------------------------------------------------------------------
 $tabDiscovery = New-Object System.Windows.Forms.TabPage
-$tabDiscovery.Text = "Discovery"
+$tabDiscovery.Text = "HirschDiscovery"
 $tabDiscovery.Padding = New-Object System.Windows.Forms.Padding(6)
 $tabControl.TabPages.Add($tabDiscovery)
 
@@ -2377,16 +2517,6 @@ $numDiscTimeout.Minimum = 1
 $numDiscTimeout.Maximum = 30
 $numDiscTimeout.Value = 5
 $panelDiscTop.Controls.Add($numDiscTimeout)
-
-$chkDiscSsh = New-Object System.Windows.Forms.CheckBox
-$chkDiscSsh.Text = "SSH Enrich"
-$chkDiscSsh.Location = New-Object System.Drawing.Point(330, 36)
-$chkDiscSsh.AutoSize = $true
-$chkDiscSsh.Checked = $false
-$panelDiscTop.Controls.Add($chkDiscSsh)
-
-$toolTipDiscSsh = New-Object System.Windows.Forms.ToolTip
-$toolTipDiscSsh.SetToolTip($chkDiscSsh, "When enabled, uses SSH to gather additional device details`n(hostname, config) after multicast discovery. Requires credentials.")
 
 # -- Discovery bottom panel: progress + status --
 $panelDiscBottom = New-Object System.Windows.Forms.Panel
@@ -2560,6 +2690,319 @@ $rtbDiscLog.BackColor = [System.Drawing.Color]::FromArgb(30, 30, 30)
 $rtbDiscLog.ForeColor = [System.Drawing.Color]::LightGreen
 $rtbDiscLog.Font = New-Object System.Drawing.Font("Consolas", 9)
 $splitDisc.Panel2.Controls.Add($rtbDiscLog)
+
+# =====================================================================
+# TAB 6: Diagram
+# =====================================================================
+$tabDiagram = New-Object System.Windows.Forms.TabPage
+$tabDiagram.Text = "Diagram"
+$tabDiagram.Padding = New-Object System.Windows.Forms.Padding(8)
+$tabControl.TabPages.Add($tabDiagram)
+
+# -- Diagram top panel: folder path + buttons --
+$panelDiagTop = New-Object System.Windows.Forms.Panel
+$panelDiagTop.Dock = 'Top'
+$panelDiagTop.Height = 40
+$tabDiagram.Controls.Add($panelDiagTop)
+
+$lblDiagFolder = New-Object System.Windows.Forms.Label
+$lblDiagFolder.Text = "Audit Folder:"
+$lblDiagFolder.Location = New-Object System.Drawing.Point(5, 12)
+$lblDiagFolder.AutoSize = $true
+$panelDiagTop.Controls.Add($lblDiagFolder)
+
+$txtDiagFolder = New-Object System.Windows.Forms.TextBox
+$txtDiagFolder.Location = New-Object System.Drawing.Point(90, 9)
+$txtDiagFolder.Size = New-Object System.Drawing.Size(350, 23)
+$txtDiagFolder.Text = [Environment]::GetFolderPath("Desktop")
+$panelDiagTop.Controls.Add($txtDiagFolder)
+
+$btnDiagBrowse = New-Object System.Windows.Forms.Button
+$btnDiagBrowse.Text = "Browse"
+$btnDiagBrowse.Location = New-Object System.Drawing.Point(448, 7)
+$btnDiagBrowse.Size = New-Object System.Drawing.Size(70, 27)
+$panelDiagTop.Controls.Add($btnDiagBrowse)
+
+$btnDiagAnalyze = New-Object System.Windows.Forms.Button
+$btnDiagAnalyze.Text = "Analyze"
+$btnDiagAnalyze.Location = New-Object System.Drawing.Point(525, 7)
+$btnDiagAnalyze.Size = New-Object System.Drawing.Size(80, 27)
+$panelDiagTop.Controls.Add($btnDiagAnalyze)
+
+$btnDiagExport = New-Object System.Windows.Forms.Button
+$btnDiagExport.Text = "Export draw.io"
+$btnDiagExport.Location = New-Object System.Drawing.Point(612, 7)
+$btnDiagExport.Size = New-Object System.Drawing.Size(100, 27)
+$btnDiagExport.Enabled = $false
+$panelDiagTop.Controls.Add($btnDiagExport)
+
+# -- Diagram bottom panel: status --
+$panelDiagBottom = New-Object System.Windows.Forms.Panel
+$panelDiagBottom.Dock = 'Bottom'
+$panelDiagBottom.Height = 25
+$tabDiagram.Controls.Add($panelDiagBottom)
+
+$lblDiagStatus = New-Object System.Windows.Forms.Label
+$lblDiagStatus.Dock = 'Fill'
+$lblDiagStatus.TextAlign = 'MiddleLeft'
+$lblDiagStatus.Text = "Select a folder containing audit files and click Analyze."
+$panelDiagBottom.Controls.Add($lblDiagStatus)
+
+# -- Diagram main split container (upper data area vs lower log) --
+$splitDiag = New-Object System.Windows.Forms.SplitContainer
+$splitDiag.Dock = 'Fill'
+$splitDiag.Orientation = [System.Windows.Forms.Orientation]::Horizontal
+$splitDiag.SplitterDistance = 350
+$tabDiagram.Controls.Add($splitDiag)
+$tabDiagram.Controls.SetChildIndex($splitDiag, 0)
+
+# -- Canvas + Grids side-by-side (vertical split) --
+$splitDiagCanvas = New-Object System.Windows.Forms.SplitContainer
+$splitDiagCanvas.Dock = 'Fill'
+$splitDiagCanvas.Orientation = [System.Windows.Forms.Orientation]::Vertical
+$splitDiagCanvas.SplitterDistance = 400
+$splitDiag.Panel1.Controls.Add($splitDiagCanvas)
+
+# -- GDI+ visual preview panel (left side) --
+$panelDiagDraw = New-Object System.Windows.Forms.Panel
+$panelDiagDraw.Dock = 'Fill'
+$panelDiagDraw.AutoScroll = $true
+$panelDiagDraw.BackColor = [System.Drawing.Color]::White
+$panelDiagDraw.BorderStyle = 'FixedSingle'
+# Enable double-buffering via reflection to prevent flicker
+$dbProp = [System.Windows.Forms.Panel].GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'NonPublic,Instance')
+$dbProp.SetValue($panelDiagDraw, $true)
+$splitDiagCanvas.Panel1.Controls.Add($panelDiagDraw)
+
+# -- Grids split (right side): connections + devices --
+$splitDiagUpper = New-Object System.Windows.Forms.SplitContainer
+$splitDiagUpper.Dock = 'Fill'
+$splitDiagUpper.Orientation = [System.Windows.Forms.Orientation]::Horizontal
+$splitDiagUpper.SplitterDistance = 140
+$splitDiagCanvas.Panel2.Controls.Add($splitDiagUpper)
+
+# -- Connections grid --
+$dgvDiagConn = New-Object System.Windows.Forms.DataGridView
+$dgvDiagConn.Dock = 'Fill'
+$dgvDiagConn.AllowUserToAddRows = $false
+$dgvDiagConn.AllowUserToDeleteRows = $false
+$dgvDiagConn.ReadOnly = $true
+$dgvDiagConn.SelectionMode = 'FullRowSelect'
+$dgvDiagConn.RowHeadersVisible = $false
+$dgvDiagConn.AutoSizeColumnsMode = 'Fill'
+$dgvDiagConn.BackgroundColor = [System.Drawing.Color]::White
+
+$null = $dgvDiagConn.Columns.Add((New-Object System.Windows.Forms.DataGridViewTextBoxColumn -Property @{ Name = "Source"; HeaderText = "Source Device"; FillWeight = 25 }))
+$null = $dgvDiagConn.Columns.Add((New-Object System.Windows.Forms.DataGridViewTextBoxColumn -Property @{ Name = "SrcPort"; HeaderText = "Src Port"; FillWeight = 15 }))
+$null = $dgvDiagConn.Columns.Add((New-Object System.Windows.Forms.DataGridViewTextBoxColumn -Property @{ Name = "Destination"; HeaderText = "Dest Device"; FillWeight = 25 }))
+$null = $dgvDiagConn.Columns.Add((New-Object System.Windows.Forms.DataGridViewTextBoxColumn -Property @{ Name = "DstPort"; HeaderText = "Dst Port"; FillWeight = 15 }))
+$null = $dgvDiagConn.Columns.Add((New-Object System.Windows.Forms.DataGridViewTextBoxColumn -Property @{ Name = "LinkInfo"; HeaderText = "Link Info"; FillWeight = 20 }))
+$splitDiagUpper.Panel1.Controls.Add($dgvDiagConn)
+
+# -- Devices grid --
+$dgvDiagDev = New-Object System.Windows.Forms.DataGridView
+$dgvDiagDev.Dock = 'Fill'
+$dgvDiagDev.AllowUserToAddRows = $false
+$dgvDiagDev.AllowUserToDeleteRows = $false
+$dgvDiagDev.ReadOnly = $true
+$dgvDiagDev.SelectionMode = 'FullRowSelect'
+$dgvDiagDev.RowHeadersVisible = $false
+$dgvDiagDev.AutoSizeColumnsMode = 'Fill'
+$dgvDiagDev.BackgroundColor = [System.Drawing.Color]::White
+
+$null = $dgvDiagDev.Columns.Add((New-Object System.Windows.Forms.DataGridViewTextBoxColumn -Property @{ Name = "DevHostname"; HeaderText = "Hostname"; FillWeight = 20 }))
+$null = $dgvDiagDev.Columns.Add((New-Object System.Windows.Forms.DataGridViewTextBoxColumn -Property @{ Name = "DevIP"; HeaderText = "IP Address"; FillWeight = 15 }))
+$null = $dgvDiagDev.Columns.Add((New-Object System.Windows.Forms.DataGridViewTextBoxColumn -Property @{ Name = "DevType"; HeaderText = "Type"; FillWeight = 12 }))
+$null = $dgvDiagDev.Columns.Add((New-Object System.Windows.Forms.DataGridViewTextBoxColumn -Property @{ Name = "DevMAC"; HeaderText = "MAC Address"; FillWeight = 18 }))
+$null = $dgvDiagDev.Columns.Add((New-Object System.Windows.Forms.DataGridViewTextBoxColumn -Property @{ Name = "DevModel"; HeaderText = "Model"; FillWeight = 20 }))
+$null = $dgvDiagDev.Columns.Add((New-Object System.Windows.Forms.DataGridViewTextBoxColumn -Property @{ Name = "DevAudited"; HeaderText = "Audited"; FillWeight = 8 }))
+$null = $dgvDiagDev.Columns.Add((New-Object System.Windows.Forms.DataGridViewTextBoxColumn -Property @{ Name = "DevConns"; HeaderText = "Connections"; FillWeight = 7 }))
+$splitDiagUpper.Panel2.Controls.Add($dgvDiagDev)
+
+# -- Lower: log --
+$rtbDiagLog = New-Object System.Windows.Forms.RichTextBox
+$rtbDiagLog.Dock = 'Fill'
+$rtbDiagLog.ReadOnly = $true
+$rtbDiagLog.BackColor = [System.Drawing.Color]::FromArgb(30, 30, 30)
+$rtbDiagLog.ForeColor = [System.Drawing.Color]::LightGreen
+$rtbDiagLog.Font = New-Object System.Drawing.Font("Consolas", 9)
+$splitDiag.Panel2.Controls.Add($rtbDiagLog)
+
+# -- GDI+ Paint handler for visual diagram preview --
+$panelDiagDraw.Add_Paint({
+    param($sender, $e)
+    $g = $e.Graphics
+    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::ClearTypeGridFit
+
+    if ($script:diagDeviceRects.Count -eq 0) {
+        $phFont = New-Object System.Drawing.Font("Segoe UI", 11)
+        $phBrush = [System.Drawing.Brushes]::Gray
+        $g.DrawString("Run Analyze to see topology preview", $phFont, $phBrush, 20, 20)
+        $phFont.Dispose()
+        return
+    }
+
+    $scrollX = $sender.AutoScrollPosition.X
+    $scrollY = $sender.AutoScrollPosition.Y
+
+    # --- Draw connection lines first (behind nodes) ---
+    $linePen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(150, 100, 100, 100), 2)
+    $labelFont = New-Object System.Drawing.Font("Segoe UI", 7)
+    $labelBrush = [System.Drawing.Brushes]::DimGray
+    $whiteBrush = [System.Drawing.Brushes]::White
+
+    foreach ($conn in $script:diagConnections) {
+        $srcR = $script:diagDeviceRects[$conn.Src]
+        $dstR = $script:diagDeviceRects[$conn.Dst]
+        if ($srcR -and $dstR) {
+            $sx = $srcR.X + $srcR.W / 2 + $scrollX
+            $sy = $srcR.Y + $srcR.H / 2 + $scrollY
+            $dx = $dstR.X + $dstR.W / 2 + $scrollX
+            $dy = $dstR.Y + $dstR.H / 2 + $scrollY
+            $g.DrawLine($linePen, [float]$sx, [float]$sy, [float]$dx, [float]$dy)
+
+            # Port label at midpoint
+            $mx = ($sx + $dx) / 2
+            $my = ($sy + $dy) / 2
+            $label = "$($conn.SrcPort) - $($conn.DstPort)"
+            $labelSize = $g.MeasureString($label, $labelFont)
+            $g.FillRectangle($whiteBrush, [float]($mx - $labelSize.Width / 2 - 2), [float]($my - $labelSize.Height / 2 - 1), $labelSize.Width + 4, $labelSize.Height + 2)
+            $g.DrawString($label, $labelFont, $labelBrush, [float]($mx - $labelSize.Width / 2), [float]($my - $labelSize.Height / 2))
+        }
+    }
+    $linePen.Dispose()
+
+    # --- Draw device nodes ---
+    $fontBold = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+    $fontSmall = New-Object System.Drawing.Font("Segoe UI", 7.5)
+    $textBrush = [System.Drawing.Brushes]::Black
+    $sf = New-Object System.Drawing.StringFormat
+    $sf.Alignment = [System.Drawing.StringAlignment]::Center
+
+    foreach ($key in $script:diagDeviceRects.Keys) {
+        $r = $script:diagDeviceRects[$key]
+        $dev = $r.Dev
+        $rx = $r.X + $scrollX
+        $ry = $r.Y + $scrollY
+
+        # Vendor colors
+        $fill = '#f5f5f5'; $stroke = '#666666'
+        if ($dev.Type) {
+            switch -Wildcard ($dev.Type) {
+                '*Hirschmann*' { $fill = '#dae8fc'; $stroke = '#6c8ebf' }
+                '*Cisco*'      { $fill = '#d5e8d4'; $stroke = '#82b366' }
+                '*Moxa*'       { $fill = '#ffe6cc'; $stroke = '#d6b656' }
+            }
+        }
+
+        $fillBrush = New-Object System.Drawing.SolidBrush([System.Drawing.ColorTranslator]::FromHtml($fill))
+        $borderPen = New-Object System.Drawing.Pen([System.Drawing.ColorTranslator]::FromHtml($stroke), 2)
+        if (-not $dev.Audited) { $borderPen.DashStyle = [System.Drawing.Drawing2D.DashStyle]::Dash }
+
+        # Rounded rectangle via GraphicsPath
+        $path = New-Object System.Drawing.Drawing2D.GraphicsPath
+        $rad = 10
+        $path.AddArc([float]$rx, [float]$ry, [float]$rad, [float]$rad, 180, 90)
+        $path.AddArc([float]($rx + $r.W - $rad), [float]$ry, [float]$rad, [float]$rad, 270, 90)
+        $path.AddArc([float]($rx + $r.W - $rad), [float]($ry + $r.H - $rad), [float]$rad, [float]$rad, 0, 90)
+        $path.AddArc([float]$rx, [float]($ry + $r.H - $rad), [float]$rad, [float]$rad, 90, 90)
+        $path.CloseFigure()
+
+        $g.FillPath($fillBrush, $path)
+        $g.DrawPath($borderPen, $path)
+
+        # Text: hostname (bold), IP, type
+        $hostLabel = if ($dev.Hostname) { $dev.Hostname } else { "Unknown" }
+        $g.DrawString($hostLabel, $fontBold, $textBrush, (New-Object System.Drawing.RectangleF([float]$rx, [float]($ry + 5), [float]$r.W, 18)), $sf)
+        if ($dev.IP) {
+            $g.DrawString($dev.IP, $fontSmall, $textBrush, (New-Object System.Drawing.RectangleF([float]$rx, [float]($ry + 22), [float]$r.W, 16)), $sf)
+        }
+        if ($dev.Type) {
+            $g.DrawString($dev.Type, $fontSmall, [System.Drawing.Brushes]::DimGray, (New-Object System.Drawing.RectangleF([float]$rx, [float]($ry + 38), [float]$r.W, 16)), $sf)
+        }
+
+        $fillBrush.Dispose()
+        $borderPen.Dispose()
+        $path.Dispose()
+    }
+
+    $fontBold.Dispose()
+    $fontSmall.Dispose()
+    $labelFont.Dispose()
+    $sf.Dispose()
+})
+
+# -- Diagram canvas: MouseDown (start drag) --
+$panelDiagDraw.Add_MouseDown({
+    param($sender, $e)
+    if ($e.Button -ne [System.Windows.Forms.MouseButtons]::Left) { return }
+    if ($script:diagDeviceRects.Count -eq 0) { return }
+
+    # Convert click to canvas coords (undo scroll offset)
+    $mx = $e.X - $sender.AutoScrollPosition.X
+    $my = $e.Y - $sender.AutoScrollPosition.Y
+
+    # Hit-test: find which device rect contains the click
+    foreach ($key in $script:diagDeviceRects.Keys) {
+        $r = $script:diagDeviceRects[$key]
+        if ($mx -ge $r.X -and $mx -le ($r.X + $r.W) -and $my -ge $r.Y -and $my -le ($r.Y + $r.H)) {
+            $script:diagDragKey = $key
+            $script:diagDragOffsetX = $mx - $r.X
+            $script:diagDragOffsetY = $my - $r.Y
+            $sender.Cursor = [System.Windows.Forms.Cursors]::SizeAll
+            return
+        }
+    }
+})
+
+# -- Diagram canvas: MouseMove (drag + hover cursor) --
+$panelDiagDraw.Add_MouseMove({
+    param($sender, $e)
+    $mx = $e.X - $sender.AutoScrollPosition.X
+    $my = $e.Y - $sender.AutoScrollPosition.Y
+
+    if ($script:diagDragKey) {
+        # Update the dragged node position
+        $r = $script:diagDeviceRects[$script:diagDragKey]
+        $r.X = $mx - $script:diagDragOffsetX
+        $r.Y = $my - $script:diagDragOffsetY
+        $sender.Invalidate()
+    } else {
+        # Hover cursor: SizeAll over a node, Default otherwise
+        $overNode = $false
+        if ($script:diagDeviceRects.Count -gt 0) {
+            foreach ($key in $script:diagDeviceRects.Keys) {
+                $r = $script:diagDeviceRects[$key]
+                if ($mx -ge $r.X -and $mx -le ($r.X + $r.W) -and $my -ge $r.Y -and $my -le ($r.Y + $r.H)) {
+                    $overNode = $true
+                    break
+                }
+            }
+        }
+        $sender.Cursor = if ($overNode) { [System.Windows.Forms.Cursors]::SizeAll } else { [System.Windows.Forms.Cursors]::Default }
+    }
+})
+
+# -- Diagram canvas: MouseUp (end drag, recalc scroll) --
+$panelDiagDraw.Add_MouseUp({
+    param($sender, $e)
+    if ($script:diagDragKey) {
+        $script:diagDragKey = $null
+
+        # Recalculate AutoScrollMinSize to encompass all nodes
+        $maxX = 0; $maxY = 0
+        foreach ($key in $script:diagDeviceRects.Keys) {
+            $r = $script:diagDeviceRects[$key]
+            $right = $r.X + $r.W + 30
+            $bottom = $r.Y + $r.H + 30
+            if ($right -gt $maxX) { $maxX = $right }
+            if ($bottom -gt $maxY) { $maxY = $bottom }
+        }
+        $sender.AutoScrollMinSize = New-Object System.Drawing.Size([int]$maxX, [int]$maxY)
+        $sender.Invalidate()
+    }
+})
 
 # -- Selection button handlers --
 $btnDiscSelectAll.Add_Click({
@@ -3033,7 +3476,7 @@ $uiTimer.Add_Tick({
             $row.Cells["Netmask"].Value = $dev.Netmask
             $row.Cells["Gateway"].Value = $dev.Gateway
             $row.Cells["Hostname"].Value = $dev.Hostname
-            $row.Cells["Type"].Value = "mgmt"
+            $row.Cells["Type"].Value = "Hirschmann"
             $row.Cells["Product"].Value = $dev.Product
             $row.Cells["Firmware"].Value = $dev.Firmware
             $row.Cells["Serial"].Value = $dev.Serial
@@ -3072,6 +3515,83 @@ $uiTimer.Add_Tick({
         }
         $sync.DiscoveryLogIndex = $discLogEntries.Count
         $rtbDiscLog.ScrollToCaret()
+    }
+
+    # Update Diagram status
+    if ($sync.DiagramStatus) {
+        $lblDiagStatus.Text = $sync.DiagramStatus
+    }
+
+    # Populate Diagram grids on completion
+    if ($sync.DiagramComplete) {
+        $sync.DiagramComplete = $false
+        $btnDiagAnalyze.Enabled = $true
+
+        $dgvDiagConn.Rows.Clear()
+        foreach ($conn in $sync.DiagramConnections) {
+            $null = $dgvDiagConn.Rows.Add($conn.SrcName, $conn.SrcPort, $conn.DstName, $conn.DstPort, $conn.LinkInfo)
+        }
+
+        $dgvDiagDev.Rows.Clear()
+        foreach ($key in $sync.DiagramDevices.Keys) {
+            $dev = $sync.DiagramDevices[$key]
+            $null = $dgvDiagDev.Rows.Add($dev.Hostname, $dev.IP, $dev.Type, $dev.MAC, $dev.Model, $(if ($dev.Audited) { "Yes" } else { "No" }), $dev.ConnectionCount)
+        }
+
+        $btnDiagExport.Enabled = ($sync.DiagramDevices.Count -gt 0)
+        $lblDiagStatus.Text = "Analysis complete. $($sync.DiagramDevices.Count) device(s), $($sync.DiagramConnections.Count) connection(s)."
+
+        # --- Build visual layout for GDI+ canvas ---
+        $script:diagDeviceRects = @{}
+        $script:diagConnections = @()
+        $devKeys = @($sync.DiagramDevices.Keys)
+        $colCount = 4; $xSp = 200; $ySp = 100; $xOff = 30; $yOff = 30
+        $nodeW = 160; $nodeH = 60
+
+        for ($di = 0; $di -lt $devKeys.Count; $di++) {
+            $col = $di % $colCount
+            $row = [math]::Floor($di / $colCount)
+            $script:diagDeviceRects[$devKeys[$di]] = @{
+                X = $xOff + ($col * $xSp)
+                Y = $yOff + ($row * $ySp)
+                W = $nodeW
+                H = $nodeH
+                Dev = $sync.DiagramDevices[$devKeys[$di]]
+            }
+        }
+
+        # Virtual canvas size for scrolling
+        $totalW = $xOff + ($colCount * $xSp) + 50
+        $rowCount = [math]::Ceiling($devKeys.Count / $colCount)
+        if ($rowCount -lt 1) { $rowCount = 1 }
+        $totalH = $yOff + ($rowCount * $ySp) + 50
+        $panelDiagDraw.AutoScrollMinSize = New-Object System.Drawing.Size($totalW, $totalH)
+
+        # Resolve connections
+        foreach ($conn in $sync.DiagramConnections) {
+            $script:diagConnections += @{
+                Src     = $conn.SrcDevKey
+                Dst     = $conn.DstDevKey
+                SrcPort = $conn.SrcPort
+                DstPort = $conn.DstPort
+                SrcName = $conn.SrcName
+                DstName = $conn.DstName
+            }
+        }
+
+        # Trigger canvas repaint
+        $panelDiagDraw.Invalidate()
+    }
+
+    # Process Diagram log entries
+    $diagLogEntries = $sync.DiagramLog
+    if ($diagLogEntries.Count -gt $sync.DiagramLogIndex) {
+        for ($i = $sync.DiagramLogIndex; $i -lt $diagLogEntries.Count; $i++) {
+            $entry = $diagLogEntries[$i]
+            $rtbDiagLog.AppendText("$entry`n")
+        }
+        $sync.DiagramLogIndex = $diagLogEntries.Count
+        $rtbDiagLog.ScrollToCaret()
     }
 })
 $uiTimer.Start()
@@ -5105,7 +5625,7 @@ $btnDiscScan.Add_Click({
     $discPS.Runspace = $discRS
 
     $null = $discPS.AddScript({
-        param([byte[]]$Packet, [string]$LocalIP, [int]$TimeoutSec, [hashtable]$SyncHash, [bool]$DoSsh, $CredsArray, [string]$PlinkPath)
+        param([byte[]]$Packet, [string]$LocalIP, [int]$TimeoutSec, [hashtable]$SyncHash)
 
         function ParseResponseInner {
             param([byte[]]$Data)
@@ -5314,7 +5834,7 @@ $btnDiscScan.Add_Click({
             Add-SyncLog -SyncHash $SyncHash -Channel "Discovery" -Message "Discovery complete. Found $($devices.Count) Hirschmann device(s)."
         }
         $SyncHash.DiscoveryComplete = $true
-    }).AddArgument($discoveryPacket).AddArgument($localIP).AddArgument($timeoutSec).AddArgument($sync).AddArgument($chkDiscSsh.Checked).AddArgument(@()).AddArgument("")
+    }).AddArgument($discoveryPacket).AddArgument($localIP).AddArgument($timeoutSec).AddArgument($sync)
 
     $null = $discPS.BeginInvoke()
     $script:discoveryRunspace = @{ PS = $discPS; RS = $discRS }
@@ -5581,6 +6101,401 @@ function Invoke-DiscChangePwd {
     $rtbDiscLog.ScrollToCaret()
 }
 
+# =====================================================================
+# DIAGRAM TAB: Event Handlers
+# =====================================================================
+
+# -- Diagram Browse --
+$btnDiagBrowse.Add_Click({
+    $fbd = New-Object System.Windows.Forms.FolderBrowserDialog
+    $fbd.Description = "Select folder containing audit files"
+    $fbd.SelectedPath = $txtDiagFolder.Text
+    if ($fbd.ShowDialog() -eq 'OK') {
+        $txtDiagFolder.Text = $fbd.SelectedPath
+    }
+})
+
+# -- Diagram Analyze --
+$btnDiagAnalyze.Add_Click({
+    $folder = $txtDiagFolder.Text.Trim()
+    if (-not (Test-Path $folder -PathType Container)) {
+        [System.Windows.Forms.MessageBox]::Show("Folder not found: $folder", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+        return
+    }
+
+    $auditFiles = @(Get-ChildItem -Path $folder -Filter "Audit_*.txt" -File | Select-Object -ExpandProperty FullName)
+    if ($auditFiles.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show("No audit files (Audit_*.txt) found in:`n$folder", "No Files", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+        return
+    }
+
+    # Clean up previous runspace
+    if ($script:diagramRunspace) {
+        try {
+            if ($script:diagramRunspace.PS) { $script:diagramRunspace.PS.Stop(); $script:diagramRunspace.PS.Dispose() }
+            if ($script:diagramRunspace.RS) { $script:diagramRunspace.RS.Close(); $script:diagramRunspace.RS.Dispose() }
+        } catch {}
+        $script:diagramRunspace = $null
+    }
+
+    $sync.DiagramLog = @()
+    $sync.DiagramLogIndex = 0
+    $sync.DiagramStatus = "Analyzing $($auditFiles.Count) audit file(s)..."
+    $sync.DiagramComplete = $false
+    $sync.DiagramDevices = @{}
+    $sync.DiagramConnections = @()
+
+    $dgvDiagConn.Rows.Clear()
+    $dgvDiagDev.Rows.Clear()
+    $rtbDiagLog.Clear()
+    $btnDiagAnalyze.Enabled = $false
+    $btnDiagExport.Enabled = $false
+
+    # Clear visual canvas and drag state
+    $script:diagDeviceRects = @{}
+    $script:diagConnections = @()
+    $script:diagDragKey = $null
+    $panelDiagDraw.AutoScrollMinSize = [System.Drawing.Size]::Empty
+    $panelDiagDraw.Invalidate()
+
+    $diagRS = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace($script:sharedISS)
+    $diagRS.Open()
+    $diagPS = [PowerShell]::Create()
+    $diagPS.Runspace = $diagRS
+
+    $null = $diagPS.AddScript({
+        param([string[]]$AuditFiles, [hashtable]$SyncHash)
+
+        $devices = @{}      # key = normalized MAC or IP, value = device hashtable
+        $connections = @{}   # key = sorted edge key, value = connection hashtable
+
+        Add-SyncLog -SyncHash $SyncHash -Channel "Diagram" -Message "Starting analysis of $($AuditFiles.Count) audit file(s)..."
+
+        $fileIndex = 0
+        foreach ($filePath in $AuditFiles) {
+            $fileIndex++
+            $fileName = [System.IO.Path]::GetFileName($filePath)
+            $SyncHash.DiagramStatus = "Parsing $fileName ($fileIndex/$($AuditFiles.Count))..."
+            Add-SyncLog -SyncHash $SyncHash -Channel "Diagram" -Message "Parsing: $fileName"
+
+            try {
+                $rawContent = [System.IO.File]::ReadAllText($filePath, [System.Text.Encoding]::UTF8)
+                # Strip null bytes (Moxa UTF-16 artifacts)
+                $rawContent = $rawContent -replace '\x00', ''
+                $lines = $rawContent -split "`n"
+
+                # --- Parse header ---
+                $devHostname = ""
+                $devIP = ""
+                $devType = ""
+                $devMAC = ""
+                $devModel = ""
+
+                foreach ($line in $lines[0..([Math]::Min(10, $lines.Count - 1))]) {
+                    if ($line -match '^\s*Device:\s*(.+?)\s*\((\d+\.\d+\.\d+\.\d+)\)') {
+                        $devHostname = $Matches[1].Trim()
+                        $devIP = $Matches[2].Trim()
+                    }
+                    if ($line -match '^\s*Type:\s*(\S+)') {
+                        $devType = $Matches[1].Trim()
+                    }
+                }
+
+                # --- Parse banner for MAC and model ---
+                foreach ($line in $lines[0..([Math]::Min(50, $lines.Count - 1))]) {
+                    if ($line -match 'Base MAC\s*:\s*([0-9A-Fa-f:.-]+)') {
+                        $devMAC = Normalize-MAC $Matches[1].Trim()
+                    }
+                    if (-not $devMAC -and $line -match 'MAC address.*?:\s*([0-9A-Fa-f:.-]+)') {
+                        $devMAC = Normalize-MAC $Matches[1].Trim()
+                    }
+                    if ($line -match '(RSP\S*|MACH\S*|MSP\S*|OCTOPUS\S*|BRS\S*)\s+Release\s+(HiOS\S+|HiLCOS\S+|\S+)') {
+                        $devModel = "$($Matches[1]) $($Matches[2])"
+                    }
+                }
+
+                # Device key: prefer MAC, fallback to IP
+                $devKey = if ($devMAC) { $devMAC } else { $devIP }
+                if (-not $devKey) {
+                    Add-SyncLog -SyncHash $SyncHash -Channel "Diagram" -Message "  WARNING: Could not identify device in $fileName, skipping."
+                    continue
+                }
+
+                # Add/update device
+                if (-not $devices.ContainsKey($devKey)) {
+                    $devices[$devKey] = @{
+                        Hostname        = $devHostname
+                        IP              = $devIP
+                        Type            = $devType
+                        MAC             = $devMAC
+                        Model           = $devModel
+                        Audited         = $true
+                        ConnectionCount = 0
+                        PortsUp         = @()
+                    }
+                } else {
+                    $devices[$devKey].Audited = $true
+                    if ($devHostname) { $devices[$devKey].Hostname = $devHostname }
+                    if ($devIP) { $devices[$devKey].IP = $devIP }
+                    if ($devType) { $devices[$devKey].Type = $devType }
+                    if ($devModel) { $devices[$devKey].Model = $devModel }
+                }
+
+                # --- Parse LLDP remote-data (Hirschmann format) ---
+                $lldpNeighbors = @()
+                $inLldpBlock = $false
+                $currentNeighbor = $null
+
+                for ($i = 0; $i -lt $lines.Count; $i++) {
+                    $line = $lines[$i].TrimEnd()
+
+                    # Start of LLDP block
+                    if ($line -match 'Remote data,\s*(\d+/\d+)\s*-\s*#(\d+)') {
+                        if ($currentNeighbor) { $lldpNeighbors += $currentNeighbor }
+                        $currentNeighbor = @{
+                            LocalPort   = $Matches[1]
+                            RemoteIP    = ""
+                            RemoteName  = ""
+                            RemoteDesc  = ""
+                            RemotePort  = ""
+                            ChassisID   = ""
+                            PortID      = ""
+                        }
+                        $inLldpBlock = $true
+                        continue
+                    }
+
+                    # End of LLDP section
+                    if ($inLldpBlock -and ($line -match '^\([A-Za-z]' -or $line -match '^>\s*$' -or $line -match '^Error:')) {
+                        if ($currentNeighbor) { $lldpNeighbors += $currentNeighbor; $currentNeighbor = $null }
+                        $inLldpBlock = $false
+                        continue
+                    }
+
+                    # Parse key-value pairs in LLDP block
+                    if ($inLldpBlock -and $currentNeighbor -and $line -match '^\s+(.+?)\.{2,}(.+)$') {
+                        $lldpKey = $Matches[1].Trim()
+                        $lldpVal = $Matches[2].Trim()
+
+                        switch -Regex ($lldpKey) {
+                            'Management address|IPv4 Management' { $currentNeighbor.RemoteIP = $lldpVal }
+                            'System name'         { $currentNeighbor.RemoteName = $lldpVal }
+                            'System description'  { $currentNeighbor.RemoteDesc = $lldpVal }
+                            'Port description'    { $currentNeighbor.RemotePort = $lldpVal }
+                            'Chassis ID'          {
+                                if ($lldpVal -match '([0-9A-Fa-f:.-]+)') {
+                                    $currentNeighbor.ChassisID = Normalize-MAC $Matches[1]
+                                }
+                            }
+                            'Port ID' {
+                                if ($lldpVal -match '([0-9A-Fa-f:.-]+)\s*\(subtype:\s*macAddress\)') {
+                                    $currentNeighbor.PortID = Normalize-MAC $Matches[1]
+                                } elseif ($lldpVal -match '(.+?)\s*\(subtype:') {
+                                    $currentNeighbor.RemotePort = $Matches[1].Trim()
+                                }
+                            }
+                        }
+                    }
+                }
+                if ($currentNeighbor) { $lldpNeighbors += $currentNeighbor }
+
+                # --- Parse Cisco CDP neighbors detail ---
+                if ($devType -eq "Cisco") {
+                    $inCdpBlock = $false
+                    $cdpDevice = ""
+                    $cdpIP = ""
+                    $cdpLocalPort = ""
+                    $cdpRemotePort = ""
+                    $cdpPlatform = ""
+
+                    for ($i = 0; $i -lt $lines.Count; $i++) {
+                        $line = $lines[$i].TrimEnd()
+
+                        if ($line -match '^\s*Device ID:\s*(.+)') {
+                            # Save previous block
+                            if ($cdpDevice) {
+                                $remoteKey = if ($cdpIP) { $cdpIP } else { $cdpDevice }
+                                if (-not $devices.ContainsKey($remoteKey)) {
+                                    $devices[$remoteKey] = @{
+                                        Hostname = $cdpDevice; IP = $cdpIP; Type = "Cisco"
+                                        MAC = ""; Model = $cdpPlatform; Audited = $false; ConnectionCount = 0; PortsUp = @()
+                                    }
+                                }
+                                # Build edge
+                                $edgeA = "$devKey|$cdpLocalPort"
+                                $edgeB = "$remoteKey|$cdpRemotePort"
+                                $edgeKey = if ($edgeA -lt $edgeB) { "$edgeA|$edgeB" } else { "$edgeB|$edgeA" }
+                                if (-not $connections.ContainsKey($edgeKey)) {
+                                    $connections[$edgeKey] = @{
+                                        SrcDevKey = $devKey; SrcName = $devHostname; SrcPort = $cdpLocalPort
+                                        DstDevKey = $remoteKey; DstName = $cdpDevice; DstPort = $cdpRemotePort
+                                        LinkInfo = "CDP"
+                                    }
+                                }
+                            }
+                            $cdpDevice = $Matches[1].Trim()
+                            $cdpIP = ""; $cdpLocalPort = ""; $cdpRemotePort = ""; $cdpPlatform = ""
+                            $inCdpBlock = $true
+                            continue
+                        }
+
+                        if ($inCdpBlock) {
+                            if ($line -match 'IP address:\s*(\d+\.\d+\.\d+\.\d+)') { $cdpIP = $Matches[1] }
+                            if ($line -match 'Interface:\s*(\S+),.*Port ID.*?:\s*(\S+)') {
+                                $cdpLocalPort = $Matches[1]; $cdpRemotePort = $Matches[2]
+                            }
+                            if ($line -match 'Platform:\s*(.+?),') { $cdpPlatform = $Matches[1].Trim() }
+                        }
+                    }
+                    # Save last CDP block
+                    if ($cdpDevice) {
+                        $remoteKey = if ($cdpIP) { $cdpIP } else { $cdpDevice }
+                        if (-not $devices.ContainsKey($remoteKey)) {
+                            $devices[$remoteKey] = @{
+                                Hostname = $cdpDevice; IP = $cdpIP; Type = "Cisco"
+                                MAC = ""; Model = $cdpPlatform; Audited = $false; ConnectionCount = 0; PortsUp = @()
+                            }
+                        }
+                        $edgeA = "$devKey|$cdpLocalPort"
+                        $edgeB = "$remoteKey|$cdpRemotePort"
+                        $edgeKey = if ($edgeA -lt $edgeB) { "$edgeA|$edgeB" } else { "$edgeB|$edgeA" }
+                        if (-not $connections.ContainsKey($edgeKey)) {
+                            $connections[$edgeKey] = @{
+                                SrcDevKey = $devKey; SrcName = $devHostname; SrcPort = $cdpLocalPort
+                                DstDevKey = $remoteKey; DstName = $cdpDevice; DstPort = $cdpRemotePort
+                                LinkInfo = "CDP"
+                            }
+                        }
+                    }
+                }
+
+                # --- Process LLDP neighbors into devices + connections ---
+                foreach ($neighbor in $lldpNeighbors) {
+                    if (-not $neighbor.ChassisID -and -not $neighbor.RemoteIP -and -not $neighbor.RemoteName) { continue }
+
+                    # Determine remote device key
+                    $remoteKey = ""
+                    if ($neighbor.ChassisID) { $remoteKey = $neighbor.ChassisID }
+                    elseif ($neighbor.RemoteIP) { $remoteKey = $neighbor.RemoteIP }
+                    else { $remoteKey = $neighbor.RemoteName }
+
+                    if (-not $remoteKey) { continue }
+
+                    # Add remote device if not known
+                    if (-not $devices.ContainsKey($remoteKey)) {
+                        $remoteType = ""
+                        if ($neighbor.RemoteDesc -match 'Hirschmann') { $remoteType = "Hirschmann" }
+                        elseif ($neighbor.RemoteDesc -match 'Cisco') { $remoteType = "Cisco" }
+                        elseif ($neighbor.RemoteDesc -match 'Moxa') { $remoteType = "Moxa" }
+
+                        $devices[$remoteKey] = @{
+                            Hostname        = if ($neighbor.RemoteName) { $neighbor.RemoteName } else { $remoteKey }
+                            IP              = $neighbor.RemoteIP
+                            Type            = $remoteType
+                            MAC             = $neighbor.ChassisID
+                            Model           = ""
+                            Audited         = $false
+                            ConnectionCount = 0
+                            PortsUp         = @()
+                        }
+                    } else {
+                        # Update with any new info
+                        if ($neighbor.RemoteName -and -not $devices[$remoteKey].Hostname) {
+                            $devices[$remoteKey].Hostname = $neighbor.RemoteName
+                        }
+                        if ($neighbor.RemoteIP -and -not $devices[$remoteKey].IP) {
+                            $devices[$remoteKey].IP = $neighbor.RemoteIP
+                        }
+                    }
+
+                    # Extract a short remote port name
+                    $remotePortShort = $neighbor.RemotePort
+                    if ($remotePortShort -match 'Module:\s*\d+\s*Port:\s*(\d+)') {
+                        $remotePortShort = "1/$($Matches[1])"
+                    } elseif ($remotePortShort -match '(Eth\d+/\d+|Gi\d+/\d+|Fa\d+/\d+)') {
+                        $remotePortShort = $Matches[1]
+                    }
+
+                    # Build deduplicated edge
+                    $localPort = $neighbor.LocalPort
+                    $edgeA = "$devKey|$localPort"
+                    $edgeB = "$remoteKey|$remotePortShort"
+                    $edgeKey = if ($edgeA -lt $edgeB) { "$edgeA|$edgeB" } else { "$edgeB|$edgeA" }
+
+                    if (-not $connections.ContainsKey($edgeKey)) {
+                        $remoteName = if ($devices[$remoteKey].Hostname) { $devices[$remoteKey].Hostname } else { $remoteKey }
+                        $connections[$edgeKey] = @{
+                            SrcDevKey = $devKey
+                            SrcName   = $devHostname
+                            SrcPort   = $localPort
+                            DstDevKey = $remoteKey
+                            DstName   = $remoteName
+                            DstPort   = $remotePortShort
+                            LinkInfo  = "LLDP"
+                        }
+                    }
+                }
+
+                $lldpCount = $lldpNeighbors.Count
+                Add-SyncLog -SyncHash $SyncHash -Channel "Diagram" -Message "  $devHostname ($devIP) - $devType, $lldpCount LLDP neighbor(s)"
+
+            } catch {
+                Add-SyncLog -SyncHash $SyncHash -Channel "Diagram" -Message "  ERROR parsing $fileName : $($_.Exception.Message)"
+            }
+        }
+
+        # --- Update connection counts per device ---
+        foreach ($conn in $connections.Values) {
+            if ($devices.ContainsKey($conn.SrcDevKey)) {
+                $devices[$conn.SrcDevKey].ConnectionCount++
+            }
+            if ($devices.ContainsKey($conn.DstDevKey)) {
+                $devices[$conn.DstDevKey].ConnectionCount++
+            }
+        }
+
+        Add-SyncLog -SyncHash $SyncHash -Channel "Diagram" -Message "Analysis complete: $($devices.Count) device(s), $($connections.Count) connection(s)."
+
+        $SyncHash.DiagramDevices = $devices
+        $SyncHash.DiagramConnections = @($connections.Values)
+        $SyncHash.DiagramComplete = $true
+
+    }).AddArgument($auditFiles).AddArgument($sync)
+
+    $null = $diagPS.BeginInvoke()
+    $script:diagramRunspace = @{ PS = $diagPS; RS = $diagRS }
+})
+
+# -- Diagram Export draw.io --
+$btnDiagExport.Add_Click({
+    if ($sync.DiagramDevices.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show("No diagram data to export. Run Analyze first.", "No Data", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+        return
+    }
+
+    $sfd = New-Object System.Windows.Forms.SaveFileDialog
+    $sfd.Title = "Export Network Diagram"
+    $sfd.Filter = "draw.io files (*.drawio)|*.drawio|All files (*.*)|*.*"
+    $sfd.DefaultExt = "drawio"
+    $sfd.FileName = "NetworkDiagram_$(Get-Date -Format 'yyyy-MM-dd_HH-mm-ss').drawio"
+    $sfd.InitialDirectory = $txtDiagFolder.Text
+
+    if ($sfd.ShowDialog() -eq 'OK') {
+        try {
+            Export-DrawioXml -Devices $sync.DiagramDevices -Connections $sync.DiagramConnections -FilePath $sfd.FileName -DeviceRects $script:diagDeviceRects
+            $lblDiagStatus.Text = "Exported: $($sfd.FileName)"
+            [System.Windows.Forms.MessageBox]::Show(
+                "Network diagram exported successfully!`n`nFile: $($sfd.FileName)`n`nOpen this file in draw.io (app.diagrams.net) to view and edit the diagram.",
+                "Export Complete",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Information
+            )
+        } catch {
+            [System.Windows.Forms.MessageBox]::Show("Export failed: $($_.Exception.Message)", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+        }
+    }
+})
+
 # -- Form Closing: cleanup --
 $form.Add_FormClosing({
     $sync.Cancel = $true
@@ -5613,6 +6528,12 @@ $form.Add_FormClosing({
             if ($script:discoveryRunspace.PS) { $script:discoveryRunspace.PS.Stop(); $script:discoveryRunspace.PS.Dispose() }
             if ($script:discoveryRunspace.RS) { $script:discoveryRunspace.RS.Close(); $script:discoveryRunspace.RS.Dispose() }
             if ($script:discoveryRunspace.Pool) { $script:discoveryRunspace.Pool.Close(); $script:discoveryRunspace.Pool.Dispose() }
+        } catch {}
+    }
+    if ($script:diagramRunspace) {
+        try {
+            if ($script:diagramRunspace.PS) { $script:diagramRunspace.PS.Stop(); $script:diagramRunspace.PS.Dispose() }
+            if ($script:diagramRunspace.RS) { $script:diagramRunspace.RS.Close(); $script:diagramRunspace.RS.Dispose() }
         } catch {}
     }
 })
